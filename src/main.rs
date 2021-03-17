@@ -62,6 +62,7 @@ fn main() -> ! {
     task::spawn(async {
         loop {
             rprintln!("100 ms loop");
+            cortex_m::asm::bkpt();
             timer::wait(Duration::from_millis(100)).await;
         }
     });
@@ -107,6 +108,5 @@ impl Battery {
 #[exception]
 fn HardFault(ef: &ExceptionFrame) -> ! {
     rprintln!("{:#?}", ef);
-
     loop {}
 }

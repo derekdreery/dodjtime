@@ -94,8 +94,14 @@ impl Timer {
         //    - disable the compare[0] event.
         // before the overflow, or disable it otherwise.
         while let Some(timeout) = self.timeout_queue.peek() {
+            rprintln!(
+                "checking timeout {:?} to see if it's in the past",
+                timeout.time
+            );
+            rprintln!("current time: {}", CURRENT_TIME);
             if timeout.time > CURRENT_TIME {
                 // We've got through all the timers before now.
+                rprintln!("in the future so carrying on");
                 break;
             }
             // This will never fail (because we checked above with `peek`).
@@ -180,6 +186,7 @@ impl Eq for Timeout {}
 /// The resolution of the timer is about 30 microseconds. The duration will be rounded down to
 /// this resolution.
 pub async fn wait(dur: core::time::Duration) {
+    rprintln!("in timer::wait");
     struct Wait {
         end: Time,
         installed_waker: bool,
@@ -297,6 +304,7 @@ unsafe fn RTC0() {
 /// No function should have access to `CURRENT_TIME`, `TIMER`, or the RTC0 peripheral while this
 /// function is running.
 unsafe fn handle_rtc_event() {
+    rprintln!("RTC0 interrupt!");
     let rtc = &*RTC0::ptr();
 
     // We enable the compare[0] and ovrflw events only.
@@ -312,6 +320,7 @@ unsafe fn handle_rtc_event() {
         rprintln!("compare[0]: counter = {}", rtc.counter.read().bits());
         // Safety: nothing that can preempt this interrupt will access the static var, so we can
         // create an exclusive reference, and satisfy the requirements of the unsafe fn.
+        update_current_time_from_counter();
         unsafe { TIMER.handle_cc0() }
     }
 }
