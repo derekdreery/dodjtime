@@ -3,6 +3,7 @@ name = "dodjtime"
 version = "0.1.0"
 authors = ["Richard Dodd <richard.o.dodd@gmail.com>"]
 edition = "2018"
+resolver = "2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -18,12 +19,26 @@ embedded-graphics = "0.6.2"
 heapless = "0.6.1"
 chrono = { version = "0.4.19", default-features = false }
 embassy = { path = "../../contrib/embassy/embassy" }
+embassy-extras = { path = "../../contrib/embassy/embassy-extras" }
 embassy-nrf = { path = "../../contrib/embassy/embassy-nrf", features = ["52832"] }
 pin-utils = "0.1.0"
-kurbo = { path = "../../contrib/kurbo", default-features=false }
+futures = { version = "0.3.13", default-features = false, features = ["async-await"] }
+enigita = { version = "0.1.0", path = "enigita" }
+
+
+#[build-dependencies]
+#enigita-compiletime = { version = "0.1.0", path = "enigita/enigita-compiletime" }
+#build_rs = { version = "0.1.0", path = "../build_rs" }
+#anyhow = "1.0.40"
 
 [patch.crates-io]
 #nrf52832-hal = { path = "../../contrib/nrf-hal/nrf52832-hal" }
 
 [profile.release]
 #debug = true
+
+[workspace]
+members = [
+    ".",
+    "tools",
+]

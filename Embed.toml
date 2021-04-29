@@ -13,9 +13,6 @@ protocol = "Jtag"
 [default.flashing]
 # Whether or not the target should be flashed.
 enabled = true
-# Whether or not the target should be halted after reset.
-# DEPRECATED, moved to reset section
-halt_afterwards = false
 # Whether or not bytes erased but not rewritten with data from the ELF
 # should be restored with their contents before erasing.
 restore_unwritten_bytes = false
@@ -53,7 +50,7 @@ show_timestamps = true
 # Whether to save rtt history buffer on exit.
 log_enabled = false
 # Where to save rtt history buffer relative to manifest path.
-log_path = "./logs"
+log_path = "./rtt_logs"
 
 [default.gdb]
 # Whether or not a GDB server should be opened after flashing.

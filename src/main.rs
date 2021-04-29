@@ -1,80 +1,88 @@
 #![no_main]
 #![no_std]
 #![allow(incomplete_features)]
+#![allow(dead_code)]
 #![feature(type_alias_impl_trait)]
 #![feature(impl_trait_in_bindings)]
 #![feature(maybe_uninit_uninit_array)]
 #![feature(maybe_uninit_extra)]
 #![feature(maybe_uninit_slice)]
 #![feature(min_type_alias_impl_trait)]
+#![feature(const_generics)]
+#![feature(const_evaluatable_checked)]
 
-use core::pin::Pin as StdPin;
 use cortex_m_rt::{entry, exception, ExceptionFrame};
 use embassy::{
     executor::{task, Executor},
     time::{Duration, Timer},
     util::Forever,
 };
-use embassy_nrf::{
-    hal::{
-        clocks,
-        gpio::{
-            self, p0::Parts, Disconnected, Floating, Input, Level, Output, Pin, PullDown, PushPull,
-        },
-        prelude::*,
-        spim::{self, Spim},
-        Delay,
-    },
-    interrupt, pac, rtc,
-};
-use embedded_graphics::{
-    pixelcolor::{raw::RawU16, Rgb565, Rgb888},
-    prelude::*,
-};
+use embassy_nrf::{gpiote, hal::clocks, interrupt, pac, rtc, Peripherals};
+use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
+use enigita::Rect;
+use futures::{prelude::*, select_biased};
+use pin_utils::pin_mut;
 use rtt_target::{rprintln, rtt_init_print};
 
+mod battery;
 mod display;
+mod power_button;
 
-use crate::display::DisplayOff;
+//use crate::display::DisplayOff;
+use crate::display::{Backlight, Display};
 
 #[panic_handler] // panicking behavior
 fn panic(panic_info: &core::panic::PanicInfo) -> ! {
     rprintln!("{}", panic_info);
-    cortex_m::asm::udf();
-}
-
-#[task]
-async fn ms100() {
     loop {
-        rprintln!("1s tick");
-        Timer::after(Duration::from_millis(1000)).await;
+        cortex_m::asm::wfe();
     }
 }
 
-#[task]
-async fn periodic_display(mut d: DisplayOff<pac::SPIM0>) {
+/*
+/// A task that prints something when the button is pressed.
+///
+async fn button_pressed_poll(
+    mut enable_pin: p::P0_15,
+    mut read_pin: p::P0_13, /*, gpiote_tok: gpiote::Initialized*/
+) {
+    use gpio::{Input, Level, Output, OutputDrive, Pull};
+
+    let mut pressed = false;
+    let mut was_pressed = false;
+    rprintln!("entering gpio poll loop");
     loop {
-        Timer::after(Duration::from_secs(3)).await;
-        rprintln!("screen power on");
-        let mut don = d.power_on().await;
-        rprintln!("finish: screen power on");
-        for i in 0..100u8 {
-            for j in 0..100u8 {
-                unsafe {
-                    let mut don = StdPin::new_unchecked(&mut don);
-                    let color: Rgb565 = Rgb888::new(i, j, 0).into();
-                    rprintln!("writing pixel {}x{}", i, j);
-                    don.set_pixel(i.into(), j.into(), RawU16::from(color).into_inner())
-                        .await;
-                }
+        use gpiote::PortInput;
+        // Drive pin 15 high to enable the button.
+        let read_pin = Input::new(&mut read_pin, Pull::Down);
+        let enable_pin = Output::new(&mut enable_pin, Level::High, OutputDrive::Standard);
+        // Calculated by trial and error: presses are picked up with 1 cycle delay, but not with 0
+        // cycles delay.
+        cortex_m::asm::delay(1);
+        if read_pin.is_high().unwrap() {
+            if pressed == false {
+                pressed = true;
+                rprintln!("button press event (todo do something in response)");
+                was_pressed = true;
+            }
+        } else {
+            if pressed == true {
+                pressed = false;
             }
         }
-        Timer::after(Duration::from_secs(3)).await;
-        rprintln!("screen power off");
-        d = don.power_off().await;
-        rprintln!("finish: screen power off");
+        // power down the button
+        drop(enable_pin);
+        if was_pressed {
+            was_pressed = false;
+            // debounce (duration arbitrary)
+            Timer::after(Duration::from_millis(200)).await;
+        } else {
+            // schedule another poll (duration arbitrary)
+            Timer::after(Duration::from_millis(10)).await;
+        }
     }
 }
+*/
 
 static RTC: Forever<rtc::RTC<pac::RTC1>> = Forever::new();
 static ALARM: Forever<rtc::Alarm<pac::RTC1>> = Forever::new();
@@ -83,65 +91,127 @@ static EXECUTOR: Forever<Executor> = Forever::new();
 #[entry]
 fn main() -> ! {
     rtt_init_print!();
-    rprintln!("main");
 
-    let p = pac::Peripherals::take().unwrap();
+    let alarm = unsafe {
+        let p = pac::Peripherals::steal();
+        clocks::Clocks::new(p.CLOCK)
+            .enable_ext_hfosc()
+            .set_lfclk_src_external(clocks::LfOscConfiguration::NoExternalNoBypass)
+            .start_lfclk();
 
-    clocks::Clocks::new(p.CLOCK)
-        .enable_ext_hfosc()
-        .set_lfclk_src_external(clocks::LfOscConfiguration::NoExternalNoBypass)
-        .start_lfclk();
+        let rtc = RTC.put(rtc::RTC::new(p.RTC1, interrupt::take!(RTC1)));
+        rtc.start();
 
-    let rtc = RTC.put(rtc::RTC::new(p.RTC1, interrupt::take!(RTC1)));
-    rtc.start();
-    unsafe { embassy::time::set_clock(rtc) };
+        embassy::time::set_clock(rtc);
+        ALARM.put(rtc.alarm0())
+    };
 
-    let p0 = Parts::new(p.P0);
-    let display = DisplayOff::new(
-        p0.p0_22.degrade(),
-        p0.p0_26.degrade(),
-        p0.p0_25.degrade(),
-        p0.p0_18.degrade(),
-        p0.p0_02.degrade(),
-        p0.p0_03.degrade(),
-        p.SPIM0,
-        interrupt::take!(SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0),
-    );
-
-    let alarm = ALARM.put(rtc.alarm0());
     let executor = EXECUTOR.put(Executor::new());
     executor.set_alarm(alarm);
     executor.run(move |spawner| {
-        spawner.spawn(ms100()).unwrap();
-        spawner.spawn(periodic_display(display)).unwrap();
+        spawner.spawn(run()).unwrap();
     });
 }
 
-/*
-struct Battery {
-    pin: gpio::p0::P0_12<Input<PullDown>>,
-}
+#[task]
+async fn run() {
+    let Peripherals {
+        gpiote,
+        mut p0_02,
+        mut p0_03,
+        mut p0_12,
+        mut p0_13,
+        mut p0_14,
+        mut p0_15,
+        mut p0_18,
+        mut p0_22,
+        mut p0_23,
+        mut p0_25,
+        mut p0_26,
+        p0_31,
+        saadc,
+        mut spim0,
+        ..
+    } = Peripherals::take().unwrap();
+    let mut spim0_irq = interrupt::take!(SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0);
 
-impl Battery {
-    fn new<M>(pin: gpio::p0::P0_12<M>) -> Self {
-        Self {
-            pin: pin.into_pulldown_input(),
+    let gpiote_tok = gpiote::initialize(gpiote, interrupt::take!(GPIOTE));
+
+    rprintln!("on {:?}", battery::power_source(&mut p0_12));
+    let batt = battery::remaining(saadc, interrupt::take!(SAADC), p0_31).await;
+    rprintln!("batt: {:?}", batt);
+
+    loop {
+        // wait for power on
+        power_button::on_pressed(&mut p0_15, &mut p0_13, gpiote_tok).await;
+        // show screen
+        rprintln!("create display");
+        let display = Display::new(
+            &mut p0_14,
+            &mut p0_22,
+            &mut p0_23,
+            &mut spim0,
+            &mut spim0_irq,
+            &mut p0_02,
+            &mut p0_03,
+            &mut p0_26,
+            &mut p0_25,
+            &mut p0_18,
+        );
+        pin_mut!(display);
+        display.sleep_off().await;
+
+        let mut frame = display.frame::<10>(Rgb565::BLACK);
+        let top_left_area = Rect::new_unchecked(0, 0, 100, 100);
+        let top_right_area = Rect::new_unchecked(140, 0, 240, 100);
+        let bottom_left_area = Rect::new_unchecked(0, 140, 100, 240);
+        let bottom_right_area = Rect::new_unchecked(140, 140, 240, 240);
+
+        rprintln!("top left");
+        display
+            .draw_frame(frame.clear().draw(top_left_area.style(Rgb565::WHITE)))
+            .await;
+        display.set_backlight(Backlight::High);
+        rprintln!("backlight on");
+        Timer::after(Duration::from_secs(3)).await;
+        rprintln!("top right");
+        display
+            .draw_frame(
+                frame
+                    .new_frame()
+                    .draw(top_left_area.style(Rgb565::BLACK))
+                    .draw(top_right_area.style(Rgb565::WHITE)),
+            )
+            .await;
+        Timer::after(Duration::from_secs(3)).await;
+        rprintln!("bottom left");
+        display
+            .draw_frame(
+                frame
+                    .new_frame()
+                    .draw(top_right_area.style(Rgb565::BLACK))
+                    .draw(bottom_left_area.style(Rgb565::WHITE)),
+            )
+            .await;
+        Timer::after(Duration::from_secs(3)).await;
+        rprintln!("bottom right");
+        display
+            .draw_frame(
+                frame
+                    .new_frame()
+                    .draw(bottom_left_area.style(Rgb565::BLACK))
+                    .draw(bottom_right_area.style(Rgb565::WHITE)),
+            )
+            .await;
+        // wait for power off with timeout
+        select_biased! {
+            _ = power_button::on_pressed(&mut p0_15, &mut p0_13, gpiote_tok).fuse() => {},
+            _ = Timer::after(Duration::from_secs(5)).fuse() => {},
         }
-    }
-
-    fn into_pin(self) -> gpio::p0::P0_12<Disconnected> {
-        self.pin.into_disconnected()
-    }
-
-    /// True if running on batt, false if charging.
-    fn using_battery(&self) -> bool {
-        match self.pin.is_high() {
-            Ok(v) => v,
-            Err(e) => match e {},
-        }
+        // hide screen
+        drop(display);
     }
 }
-*/
 
 #[exception]
 fn HardFault(ef: &ExceptionFrame) -> ! {
