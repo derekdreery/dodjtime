@@ -1,4 +1,4 @@
-use core::pin::Pin;
+use core::{iter, pin::Pin};
 use embassy::{
     time::{Duration, Timer},
     traits::spi::FullDuplex,
@@ -15,6 +15,7 @@ use embedded_graphics::{
     pixelcolor::{raw::RawU16, Rgb565},
     prelude::*,
 };
+use enigita::Rect;
 use pin_utils::{unsafe_pinned, unsafe_unpinned};
 use rtt_target::rprintln;
 
@@ -165,7 +166,6 @@ impl<'d, T: spim::Instance> Display<'d, T> {
         // This byte array should contain 16 bit Rgb565 colors in big-endian order.
         mut buf: &[u8],
     ) {
-        debug_assert_eq!(buf.len(), area.area() * 2);
         // TODO check the buffer is in RAM (requirement for DMA).
 
         self.set_address_window(
@@ -217,6 +217,26 @@ impl<'d, T: spim::Instance> Display<'d, T> {
         if i > 0 {
             self.send_data(&buffer[..i]).await;
         }
+    }
+
+    /// Draw a filled Rect with the given color.
+    ///
+    /// This method copies into an intermediate buffer. It assumes that the color has already been
+    /// converted into bytes, with the first byte sent on the wire first. (i.e. big endian)
+    pub async fn draw_rect_color<const COLOR_BYTES: usize>(
+        self: &mut Pin<&mut Self>,
+        area: Rect,
+        color: [u8; COLOR_BYTES],
+    ) {
+        // we don't support 8 bit arch. TODO static assert this.
+        self.draw_rect_iter(
+            area,
+            iter::repeat(&color)
+                .take(area.area() as usize)
+                .flatten()
+                .copied(),
+        )
+        .await
     }
 
     /*

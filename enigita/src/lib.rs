@@ -16,6 +16,7 @@ use core::{marker::PhantomData, mem};
 use embedded_graphics::pixelcolor::PixelColor;
 use staticvec::StaticVec as Vec;
 
+/*
 /// A frame to draw.
 ///
 /// `LEN` is the maximum number of drawables that can be queued.
@@ -150,9 +151,9 @@ where
     }
 }
 
-pub enum Drawable<Color: 'static> {
+pub enum Drawable<'a> {
     Shape(StyledShape<Color>),
-    Image(Image<Color>),
+    Image(Image<'a>),
 }
 
 impl<Color: 'static + Copy> Drawable<Color> {
@@ -176,6 +177,7 @@ impl<Color: 'static> From<StyledShape<Color>> for Drawable<Color> {
         Drawable::Shape(shape)
     }
 }
+*/
 
 pub struct StyledShape<Color: 'static> {
     fill_color: Color,
@@ -441,37 +443,9 @@ impl Ellipse {
 
 // Image
 
-pub struct Image<C: 'static> {
-    area: Rect,
-    /// Require that images are available for the lifetime of the program (for now).
-    buf: &'static ImageBuf<C>,
-}
-
-impl<Color: 'static> Image<Color> {
-    fn pixel_color(&self, pixel: Point) -> Option<Color> {
-        todo!()
-    }
-
-    fn bounding_box(&self) -> Rect {
-        todo!()
-    }
-}
-
-/// An image buffer with the color type, width and height specified at compiletime.
-///
-/// It is up to the caller of `new` to ensure that the data is a valid image.
-pub struct ImageBuf<C: PixelColor, const WIDTH: usize, const HEIGHT: usize> {
-    data: [u8; WIDTH * HEIGHT * mem::size_of::<C::Raw::Storage>()],
-    color: PhantomData<C>,
-}
-
-impl<C: PixelColor, const WIDTH: usize, const HEIGHT: usize> ImageBuf<C, WIDTH, HEIGHT> {
-    pub const fn new(data: [u8; WIDTH * HEIGHT * mem::size_of::<C::Raw::Storage>()]) -> Self {
-        ImageBuf {
-            data,
-            color: PhantomData,
-        }
-    }
+pub struct Image<'a> {
+    pub area: Rect,
+    pub buf: &'a [u8],
 }
 
 // Point

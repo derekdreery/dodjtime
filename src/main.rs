@@ -161,48 +161,32 @@ async fn run() {
         pin_mut!(display);
         display.sleep_off().await;
 
-        let mut frame = display.frame::<10>(Rgb565::BLACK);
         let top_left_area = Rect::new_unchecked(0, 0, 100, 100);
         let top_right_area = Rect::new_unchecked(140, 0, 240, 100);
         let bottom_left_area = Rect::new_unchecked(0, 140, 100, 240);
         let bottom_right_area = Rect::new_unchecked(140, 140, 240, 240);
 
-        rprintln!("top left");
+        let black = Rgb565::BLACK.into_storage().to_be_bytes();
+        let white = Rgb565::WHITE.into_storage().to_be_bytes();
         display
-            .draw_frame(frame.clear().draw(top_left_area.style(Rgb565::WHITE)))
+            .draw_rect_color(Rect::new_unchecked(0, 0, 240, 240), black)
             .await;
+        rprintln!("top left");
+        display.draw_rect_color(top_left_area, white).await;
         display.set_backlight(Backlight::High);
         rprintln!("backlight on");
         Timer::after(Duration::from_secs(3)).await;
         rprintln!("top right");
-        display
-            .draw_frame(
-                frame
-                    .new_frame()
-                    .draw(top_left_area.style(Rgb565::BLACK))
-                    .draw(top_right_area.style(Rgb565::WHITE)),
-            )
-            .await;
+        display.draw_rect_color(top_left_area, black).await;
+        display.draw_rect_color(top_right_area, white).await;
         Timer::after(Duration::from_secs(3)).await;
         rprintln!("bottom left");
-        display
-            .draw_frame(
-                frame
-                    .new_frame()
-                    .draw(top_right_area.style(Rgb565::BLACK))
-                    .draw(bottom_left_area.style(Rgb565::WHITE)),
-            )
-            .await;
+        display.draw_rect_color(top_right_area, black).await;
+        display.draw_rect_color(bottom_left_area, white).await;
         Timer::after(Duration::from_secs(3)).await;
         rprintln!("bottom right");
-        display
-            .draw_frame(
-                frame
-                    .new_frame()
-                    .draw(bottom_left_area.style(Rgb565::BLACK))
-                    .draw(bottom_right_area.style(Rgb565::WHITE)),
-            )
-            .await;
+        display.draw_rect_color(bottom_left_area, black).await;
+        display.draw_rect_color(bottom_right_area, white).await;
         // wait for power off with timeout
         select_biased! {
             _ = power_button::on_pressed(&mut p0_15, &mut p0_13, gpiote_tok).fuse() => {},
