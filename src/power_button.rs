@@ -1,12 +1,9 @@
-use embassy_nrf::{gpiote::Initialized, hal::prelude::*, peripherals as p};
+use embassy_nrf::peripherals as p;
+use embedded_hal::digital::v2::InputPin;
 use futures::pin_mut;
 
 /// A future that completes when the button is pressed.
-pub async fn on_pressed(
-    enable_pin: &mut p::P0_15,
-    read_pin: &mut p::P0_13,
-    gpiote_tok: Initialized,
-) {
+pub async fn on_pressed(enable_pin: &mut p::P0_15, read_pin: &mut p::P0_13) {
     use embassy::{
         time::{Duration, Timer},
         traits::gpio::{WaitForHigh, WaitForLow},
@@ -19,7 +16,7 @@ pub async fn on_pressed(
     // this pin will be dropped if the future is dropped, disconnecting the button to save power
     let _enable_pin = Output::new(enable_pin, Level::High, OutputDrive::Standard);
     let input = Input::new(&mut *read_pin, Pull::None);
-    let port = PortInput::new(gpiote_tok, input);
+    let port = PortInput::new(input);
     pin_mut!(port);
     loop {
         port.as_mut().wait_for_low().await;

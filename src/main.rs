@@ -3,202 +3,383 @@
 #![allow(incomplete_features)]
 #![allow(dead_code)]
 #![feature(type_alias_impl_trait)]
-#![feature(impl_trait_in_bindings)]
-#![feature(maybe_uninit_uninit_array)]
-#![feature(maybe_uninit_extra)]
-#![feature(maybe_uninit_slice)]
-#![feature(min_type_alias_impl_trait)]
-#![feature(const_generics)]
-#![feature(const_evaluatable_checked)]
+
+extern crate panic_abort;
 
 use cortex_m_rt::{entry, exception, ExceptionFrame};
+use defmt::{debug, error, unwrap, Format};
+use defmt_rtt as _;
 use embassy::{
-    executor::{task, Executor},
+    executor::{Executor, Spawner},
+    interrupt::InterruptExt,
+    task,
     time::{Duration, Timer},
-    util::Forever,
+    util::{mpsc, Forever},
 };
-use embassy_nrf::{gpiote, hal::clocks, interrupt, pac, rtc, Peripherals};
-use embedded_graphics::{pixelcolor::Rgb565, prelude::*};
-use enigita::Rect;
-use futures::{prelude::*, select_biased};
+use embassy_nrf::{
+    gpiote,
+    gpiote::{InputChannel, InputChannelPolarity},
+    interrupt::{self, Priority},
+    peripherals::{self, P0_12, P0_13, P0_15, P0_31, SAADC},
+    Peripherals,
+};
+use embedded_graphics::{
+    geometry::{Point, Size},
+    pixelcolor::Rgb565,
+    prelude::*,
+    primitives::Rectangle,
+};
+use futures::prelude::*;
+use nrf_softdevice::{ble, Softdevice};
 use pin_utils::pin_mut;
-use rtt_target::{rprintln, rtt_init_print};
 
 mod battery;
+//mod ble;
 mod display;
 mod power_button;
 
 //use crate::display::DisplayOff;
-use crate::display::{Backlight, Display};
+use crate::{
+    battery::Battery,
+    display::{Backlight, DisplayFlashSpi},
+};
 
-#[panic_handler] // panicking behavior
-fn panic(panic_info: &core::panic::PanicInfo) -> ! {
-    rprintln!("{}", panic_info);
-    loop {
-        cortex_m::asm::wfe();
-    }
-}
+const CHANNEL_SIZE: usize = 3;
+const EASY_DMA_SIZE: usize = 255;
+const BG_IMAGE: &[u8] = include_bytes!("../data/pictures/clock_bg.rgb565");
 
-/*
-/// A task that prints something when the button is pressed.
-///
-async fn button_pressed_poll(
-    mut enable_pin: p::P0_15,
-    mut read_pin: p::P0_13, /*, gpiote_tok: gpiote::Initialized*/
-) {
-    use gpio::{Input, Level, Output, OutputDrive, Pull};
-
-    let mut pressed = false;
-    let mut was_pressed = false;
-    rprintln!("entering gpio poll loop");
-    loop {
-        use gpiote::PortInput;
-        // Drive pin 15 high to enable the button.
-        let read_pin = Input::new(&mut read_pin, Pull::Down);
-        let enable_pin = Output::new(&mut enable_pin, Level::High, OutputDrive::Standard);
-        // Calculated by trial and error: presses are picked up with 1 cycle delay, but not with 0
-        // cycles delay.
-        cortex_m::asm::delay(1);
-        if read_pin.is_high().unwrap() {
-            if pressed == false {
-                pressed = true;
-                rprintln!("button press event (todo do something in response)");
-                was_pressed = true;
-            }
-        } else {
-            if pressed == true {
-                pressed = false;
-            }
-        }
-        // power down the button
-        drop(enable_pin);
-        if was_pressed {
-            was_pressed = false;
-            // debounce (duration arbitrary)
-            Timer::after(Duration::from_millis(200)).await;
-        } else {
-            // schedule another poll (duration arbitrary)
-            Timer::after(Duration::from_millis(10)).await;
-        }
-    }
-}
-*/
-
-static RTC: Forever<rtc::RTC<pac::RTC1>> = Forever::new();
-static ALARM: Forever<rtc::Alarm<pac::RTC1>> = Forever::new();
 static EXECUTOR: Forever<Executor> = Forever::new();
+static BATTERY_CHANNEL: Forever<battery::Channel> = Forever::new();
+static DISPLAY_FLASH_CHANNEL: Forever<display::Channel> = Forever::new();
+static MAIN_CHANNEL: Forever<Channel> = Forever::new();
+
+type Channel = mpsc::Channel<mpsc::WithNoThreads, Cmd, CHANNEL_SIZE>;
+type Sender<'ch> = mpsc::Sender<'ch, mpsc::WithNoThreads, Cmd, CHANNEL_SIZE>;
+
+/// Commands that can be sent to the main task
+#[derive(Format)]
+enum Cmd {
+    /// The power button was pressed
+    PowerButtonPressed,
+    /// The battery task responded to a request with the current battery state
+    BatteryState(battery::State),
+}
 
 #[entry]
 fn main() -> ! {
-    rtt_init_print!();
+    // Setup embassy to use priority 2, so we don't clash with softdevice
+    let mut config = embassy_nrf::config::Config::default();
+    config.gpiote_interrupt_priority = Priority::P2;
+    config.time_interrupt_priority = Priority::P2;
+    let p = embassy_nrf::init(config);
 
-    let alarm = unsafe {
-        let p = pac::Peripherals::steal();
-        clocks::Clocks::new(p.CLOCK)
-            .enable_ext_hfosc()
-            .set_lfclk_src_external(clocks::LfOscConfiguration::NoExternalNoBypass)
-            .start_lfclk();
-
-        let rtc = RTC.put(rtc::RTC::new(p.RTC1, interrupt::take!(RTC1)));
-        rtc.start();
-
-        embassy::time::set_clock(rtc);
-        ALARM.put(rtc.alarm0())
-    };
+    // Setup bluetooth
+    let config: nrf_softdevice::Config = Default::default();
+    //let softdev = Softdevice::enable(&config);
 
     let executor = EXECUTOR.put(Executor::new());
-    executor.set_alarm(alarm);
-    executor.run(move |spawner| {
-        spawner.spawn(run()).unwrap();
+    executor.run(|spawner| {
+        // Setup display & flash task
+        let mut display_flash_channel = DISPLAY_FLASH_CHANNEL.put(display::Channel::new());
+        let (display_sender, display_receiver) = mpsc::split(display_flash_channel);
+        let spim0_irq = interrupt::take!(SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0);
+        spim0_irq.set_priority(Priority::P2);
+        let display_flash_spi = DisplayFlashSpi::new(
+            p.P0_14, p.P0_22, p.P0_23, p.TWISPI0, spim0_irq, p.P0_02, p.P0_03, p.P0_04, p.P0_26,
+            p.P0_25, p.P0_05, p.P0_18,
+        );
+
+        // Setup battery task
+        let battery_channel = BATTERY_CHANNEL.put(battery::Channel::new());
+        let (battery_sender, battery_receiver) = mpsc::split(battery_channel);
+        let saadc_irq = interrupt::take!(SAADC);
+        saadc_irq.set_priority(Priority::P2);
+
+        // Setup the channel to send messages to the main event loop
+        let mut main_channel = MAIN_CHANNEL.put(Channel::new());
+        let (main_sender, main_receiver) = mpsc::split(main_channel);
+
+        // Tick tock
+        unwrap!(spawner.spawn(alive()));
+        // Start the SoftDevice
+        //unwrap!(spawner.spawn(softdevice_task(softdev)));
+        // Start power button task
+        unwrap!(spawner.spawn(power_button_task(p.P0_15, p.P0_13, main_sender.clone())));
+        // Start display task
+        unwrap!(spawner.spawn(display_flash_task(display_flash_spi, display_receiver)));
+        // Spawn battery task
+        unwrap!(spawner.spawn(battery_task(
+            p.SAADC,
+            saadc_irq,
+            p.P0_31,
+            p.P0_12,
+            battery_receiver,
+            main_sender,
+        )));
+        unwrap!(spawner.spawn(main_task(
+            main_receiver,
+            display_sender,
+            battery_sender,
+            /*softdev*/
+        )));
     });
 }
 
 #[task]
-async fn run() {
-    let Peripherals {
-        gpiote,
-        mut p0_02,
-        mut p0_03,
-        mut p0_12,
-        mut p0_13,
-        mut p0_14,
-        mut p0_15,
-        mut p0_18,
-        mut p0_22,
-        mut p0_23,
-        mut p0_25,
-        mut p0_26,
-        p0_31,
-        saadc,
-        mut spim0,
-        ..
-    } = Peripherals::take().unwrap();
-    let mut spim0_irq = interrupt::take!(SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0);
-
-    let gpiote_tok = gpiote::initialize(gpiote, interrupt::take!(GPIOTE));
-
-    rprintln!("on {:?}", battery::power_source(&mut p0_12));
-    let batt = battery::remaining(saadc, interrupt::take!(SAADC), p0_31).await;
-    rprintln!("batt: {:?}", batt);
-
+async fn alive() {
+    let mut cnt = 0;
     loop {
-        // wait for power on
-        power_button::on_pressed(&mut p0_15, &mut p0_13, gpiote_tok).await;
-        // show screen
-        rprintln!("create display");
-        let display = Display::new(
-            &mut p0_14,
-            &mut p0_22,
-            &mut p0_23,
-            &mut spim0,
-            &mut spim0_irq,
-            &mut p0_02,
-            &mut p0_03,
-            &mut p0_26,
-            &mut p0_25,
-            &mut p0_18,
-        );
-        pin_mut!(display);
-        display.sleep_off().await;
+        Timer::after(Duration::from_secs(1)).await;
+        defmt::debug!("tick {=usize}", cnt);
+        cnt += 1;
+    }
+}
 
-        let top_left_area = Rect::new_unchecked(0, 0, 100, 100);
-        let top_right_area = Rect::new_unchecked(140, 0, 240, 100);
-        let bottom_left_area = Rect::new_unchecked(0, 140, 100, 240);
-        let bottom_right_area = Rect::new_unchecked(140, 140, 240, 240);
+#[task]
+async fn softdevice_task(sd: &'static Softdevice) {
+    sd.run().await;
+}
 
-        let black = Rgb565::BLACK.into_storage().to_be_bytes();
-        let white = Rgb565::WHITE.into_storage().to_be_bytes();
-        display
-            .draw_rect_color(Rect::new_unchecked(0, 0, 240, 240), black)
-            .await;
-        rprintln!("top left");
-        display.draw_rect_color(top_left_area, white).await;
-        display.set_backlight(Backlight::High);
-        rprintln!("backlight on");
-        Timer::after(Duration::from_secs(3)).await;
-        rprintln!("top right");
-        display.draw_rect_color(top_left_area, black).await;
-        display.draw_rect_color(top_right_area, white).await;
-        Timer::after(Duration::from_secs(3)).await;
-        rprintln!("bottom left");
-        display.draw_rect_color(top_right_area, black).await;
-        display.draw_rect_color(bottom_left_area, white).await;
-        Timer::after(Duration::from_secs(3)).await;
-        rprintln!("bottom right");
-        display.draw_rect_color(bottom_left_area, black).await;
-        display.draw_rect_color(bottom_right_area, white).await;
-        // wait for power off with timeout
-        select_biased! {
-            _ = power_button::on_pressed(&mut p0_15, &mut p0_13, gpiote_tok).fuse() => {},
-            _ = Timer::after(Duration::from_secs(5)).fuse() => {},
+// Note: the display controller also handles flash. This is because they share the same SPI
+// peripheral, and some operations need to coordinate between them (e.g. copy image from flash to
+// display).
+#[task]
+async fn display_flash_task(
+    mut display: DisplayFlashSpi,
+    mut channel: mpsc::Receiver<'static, mpsc::WithNoThreads, display::Cmd, CHANNEL_SIZE>,
+) {
+    while let Some(cmd) = channel.recv().await {
+        display.handle(cmd).await;
+    }
+}
+
+#[task]
+async fn power_button_task(mut p0_15: P0_15, mut p0_13: P0_13, channel: Sender<'static>) {
+    use embassy::{
+        time::{Duration, Timer},
+        traits::gpio::{WaitForHigh, WaitForLow},
+    };
+    use embassy_nrf::{
+        gpio::{Input, Level, Output, OutputDrive, Pull},
+        gpiote::PortInput,
+    };
+    use embedded_hal::digital::v2::InputPin;
+    let _enable_pin = Output::new(&mut p0_15, Level::High, OutputDrive::Standard);
+    let input = Input::new(&mut p0_13, Pull::None);
+    let mut port = PortInput::new(input);
+    loop {
+        port.wait_for_low().await;
+        // Wait a time to make sure we don't get spurious stuff on button press/release
+        Timer::after(Duration::from_millis(10)).await;
+        if unwrap!(port.is_low()) {
+            // try again
+            continue;
         }
-        // hide screen
-        drop(display);
+        port.wait_for_high().await;
+        // Wait some time and check we are still high, to avoid spurious short-lived signals.
+        Timer::after(Duration::from_millis(10)).await;
+        if unwrap!(port.is_high()) {
+            // we detected a button press, return
+            unwrap!(channel.send(Cmd::PowerButtonPressed).await);
+        }
+    }
+}
+
+#[task]
+async fn battery_task(
+    adc: SAADC,
+    irq: interrupt::SAADC,
+    level_pin: P0_31,
+    source_pin: P0_12,
+    mut cmd_in: mpsc::Receiver<'static, mpsc::WithNoThreads, battery::Cmd, CHANNEL_SIZE>,
+    cmd_out: Sender<'static>,
+) {
+    let mut battery = Battery::new(adc, irq, level_pin, source_pin);
+    // Only 1 command for now
+    while let Some(_) = cmd_in.recv().await {
+        unwrap!(
+            cmd_out
+                .send(Cmd::BatteryState(battery.current_state().await))
+                .await,
+            "unreachable"
+        );
+    }
+}
+
+// The main task should be a big event loop where different IO are handled. Use channels to send
+// commands to other tasks, and have a mpsc channel to collect things to handle from other tasks.
+#[task]
+async fn main_task(
+    mut main_channel: mpsc::Receiver<'static, mpsc::WithNoThreads, Cmd, CHANNEL_SIZE>,
+    display_channel: display::Sender<'static>,
+    battery_channel: battery::Sender<'static>,
+    /*softdev: &'static Softdevice,*/
+) {
+    use ble::peripheral::{
+        advertise, Config as AdvertiseConfig, NonconnectableAdvertisement::ScannableUndirected,
+    };
+
+    // Update reported battery level.
+    unwrap!(battery_channel.send(battery::Cmd::SampleBattery).await);
+    defmt::info!("{}", unwrap!(main_channel.recv().await));
+
+    // First attempt at ble, advertise a connection.
+    /*
+    let addr = ble::get_address(softdev);
+    defmt::info!(
+        "BLE address: {=[u8]:x} (type {})",
+        addr.bytes(),
+        addr.address_type()
+    );
+    */
+
+    //ble::advertise(softdevice);
+
+    /* powerup indication */
+    unwrap!(display_channel.send(display::Cmd::PowerOn).await);
+
+    let mut cnt = 0;
+    loop {
+        match unwrap!(main_channel.recv().await) {
+            Cmd::PowerButtonPressed => {
+                defmt::info!("button pressed {}", cnt);
+                cnt += 1;
+                unwrap!(battery_channel.send(battery::Cmd::SampleBattery).await);
+                defmt::info!("show some stuff");
+                // TODO don't sleep in the main thread, this is just for an example for now.
+                //debug!("sleep off");
+                unwrap!(display_channel.send(display::Cmd::SleepOff).await);
+
+                defmt::debug!("draw black");
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::fill_rect_with_color(
+                            Rectangle::new(Point::new(0, 0), Size::new(240, 240)),
+                            Rgb565::BLACK,
+                        ))
+                        .await
+                );
+                defmt::debug!("draw image");
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::DrawImage {
+                            top_left: Point::new(0, 0),
+                            image: BG_IMAGE,
+                            scale: 1,
+                        })
+                        .await
+                );
+                defmt::debug!("backlight up");
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::SetBacklight {
+                            level: Backlight::High,
+                        })
+                        .await
+                );
+                // This waits 5 secs after the message was sent - not necessarily the same as when
+                // the operation was completed (TODO).
+                Timer::after(Duration::from_secs(5)).await;
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::SetBacklight {
+                            level: Backlight::Off,
+                        })
+                        .await
+                );
+
+                /*
+                defmt::debug!("draw black");
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::fill_rect_with_color(
+                            Rectangle::new(Point::new(0, 0), Size::new(240, 240)),
+                            Rgb565::BLACK,
+                        ))
+                        .await
+                );
+                defmt::debug!("draw bg");
+                let top_left_area = Rectangle::new(Point::new(0, 0), Size::new(100, 100));
+                let top_right_area = Rectangle::new(Point::new(140, 0), Size::new(240, 100));
+                let bottom_left_area = Rectangle::new(Point::new(0, 140), Size::new(100, 240));
+                let bottom_right_area = Rectangle::new(Point::new(140, 140), Size::new(240, 240));
+
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::fill_rect_with_color(
+                            top_left_area,
+                            Rgb565::WHITE,
+                        ))
+                        .await
+                );
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::fill_rect_with_color(
+                            top_left_area,
+                            Rgb565::BLACK,
+                        ))
+                        .await
+                );
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::fill_rect_with_color(
+                            top_right_area,
+                            Rgb565::WHITE,
+                        ))
+                        .await
+                );
+                Timer::after(Duration::from_secs(3)).await;
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::fill_rect_with_color(
+                            top_right_area,
+                            Rgb565::BLACK,
+                        ))
+                        .await
+                );
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::fill_rect_with_color(
+                            bottom_left_area,
+                            Rgb565::WHITE,
+                        ))
+                        .await
+                );
+                Timer::after(Duration::from_secs(3)).await;
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::fill_rect_with_color(
+                            bottom_left_area,
+                            Rgb565::BLACK,
+                        ))
+                        .await
+                );
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::fill_rect_with_color(
+                            bottom_right_area,
+                            Rgb565::WHITE,
+                        ))
+                        .await
+                );
+                Timer::after(Duration::from_secs(3)).await;
+                unwrap!(display_channel.send(display::Cmd::SleepOn).await);
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::SetBacklight {
+                            level: Backlight::Off,
+                        })
+                        .await
+                );
+                */
+            }
+            Cmd::BatteryState(state) => defmt::info!("battery: {:?}", state),
+        }
     }
 }
 
 #[exception]
 fn HardFault(ef: &ExceptionFrame) -> ! {
-    rprintln!("{:#?}", ef);
+    error!("HardFault");
     loop {}
 }

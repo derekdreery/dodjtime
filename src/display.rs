@@ -1,65 +1,95 @@
-use core::{iter, pin::Pin};
+use core::iter;
+use defmt::{assert, debug, panic, unwrap, Format};
 use embassy::{
     time::{Duration, Timer},
-    traits::spi::FullDuplex,
-    util::PeripheralBorrow,
+    traits::spi::{FullDuplex, Write},
+    util::mpsc,
 };
-use embassy_extras::unborrow;
 use embassy_nrf::{
-    gpio::{AnyPin, Level, NoPin, Output, OutputDrive, Pin as GpioPin},
-    hal::prelude::*,
+    gpio::{FlexPin, Level, NoPin, Output, OutputDrive},
+    interrupt,
+    peripherals::{P0_02, P0_03, P0_04, P0_05, P0_14, P0_18, P0_22, P0_23, P0_25, P0_26, TWISPI0},
     spim::{self, Spim},
-    target_constants::EASY_DMA_SIZE,
 };
-use embedded_graphics::{
-    pixelcolor::{raw::RawU16, Rgb565},
-    prelude::*,
-};
-use enigita::Rect;
-use pin_utils::{unsafe_pinned, unsafe_unpinned};
-use rtt_target::rprintln;
+use embedded_hal::digital::v2::OutputPin;
 
-pub use embedded_graphics::{geometry::Point, primitives::Rectangle};
+pub use embedded_graphics::{
+    geometry::{Point, Size},
+    pixelcolor::{IntoStorage, Rgb565, RgbColor},
+    primitives::Rectangle,
+};
 
 const DISPLAY_WIDTH: usize = 240;
 const DISPLAY_HEIGHT: usize = 240;
-const DISPLAY_AREA: Rectangle = Rectangle {
-    top_left: Point { x: 0, y: 0 },
-    bottom_right: Point {
-        x: DISPLAY_WIDTH as i32,
-        y: DISPLAY_HEIGHT as i32,
-    },
-};
 const DISPLAY_PIXELS: usize = DISPLAY_WIDTH * DISPLAY_HEIGHT;
-// we are writing u16s so we need an even number of bytes.
-const BUFFER_SIZE: usize = EASY_DMA_SIZE - (EASY_DMA_SIZE % 2);
 
-/// A display driver hard-coded to the PineTime.
-pub struct Display<'d, T: spim::Instance> {
-    // TODO borrow pins with PeripheralBorrow
-    /// Backlight pin 1
-    bl1_pin: Output<'static, AnyPin>,
-    /// Backlight pin 2
-    bl2_pin: Output<'static, AnyPin>,
-    /// Backlight pin 3
-    bl3_pin: Output<'static, AnyPin>,
-    /// SPI master for the display
-    spim: Spim<'d, T>,
-    /// Reset pin
-    rst_pin: Output<'static, AnyPin>,
-    /// Chip select pin
-    cs_pin: Output<'static, AnyPin>,
-    /// data/clock switch
-    dc_pin: Output<'static, AnyPin>,
-    /// Is the screen on
-    display_on: bool,
-    // Commented out because spim captures the lifetime, but left in to remind us that we rely on
-    // this.
-    ///// We need this because we must unborrow the pins before we can degrade them.
-    //marker: PhantomData<&'d mut ()>,
+/// These are the commands that can be sent to the SPI (the display and the nor flash memory)
+#[derive(Format)]
+pub enum Cmd {
+    /// Wake the display
+    SleepOff,
+    /// Power down the display
+    SleepOn,
+    /// Fill a rectangular area with the given color
+    FillRectWithColor {
+        /// The area to fill
+        area: Rectangle,
+        /// The color to fill it with
+        color: Rgb565,
+    },
+    DrawImage {
+        top_left: Point,
+        image: &'static [u8],
+        scale: u8,
+    },
+    /// Change the backlight level
+    SetBacklight { level: Backlight },
+    /// A high-level command to display a power on indicator.
+    PowerOn,
+}
+
+impl Cmd {
+    #[inline]
+    pub fn fill_rect_with_color(area: Rectangle, color: Rgb565) -> Self {
+        Self::FillRectWithColor { area, color }
+    }
+}
+
+pub type Channel = mpsc::Channel<mpsc::WithNoThreads, Cmd, { crate::CHANNEL_SIZE }>;
+pub type Sender<'ch> = mpsc::Sender<'ch, mpsc::WithNoThreads, Cmd, { crate::CHANNEL_SIZE }>;
+
+/// A display & nor flash driver hard-coded to the PineTime.
+///
+/// These are combined because they share the same SPI peripheral.
+pub struct DisplayFlashSpi {
+    /// Backlight low brightness pin
+    bl_low_pin: FlexPin<'static, P0_14>,
+    /// Backlight medium brightness pin
+    bl_mid_pin: FlexPin<'static, P0_22>,
+    /// Backlight high brightness pin
+    bl_high_pin: FlexPin<'static, P0_23>,
+    /// SPI master periperal
+    spim: TWISPI0,
+    /// SPI master periperal interrupt
+    spim_irq: interrupt::SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0,
+    /// SPI clock pin
+    spi_clock_pin: P0_02,
+    /// SPI master -> slave data pin
+    spi_mosi_pin: P0_03,
+    /// SPI slave -> master data pin. I believe this isn't connected for the display.
+    spi_miso_pin: P0_04,
+    /// Display reset pin
+    reset_pin: P0_26,
+    /// Display chip select pin
+    display_cs_pin: P0_25,
+    /// Flash mem chip select pin
+    flash_cs_pin: P0_05,
+    /// Display data/command switch (low for command, high for data)
+    dc_pin: P0_18,
 }
 
 /// Levels that the backlight can be set to.
+#[derive(Debug, Format)]
 pub enum Backlight {
     Off,
     Low,
@@ -67,51 +97,154 @@ pub enum Backlight {
     High,
 }
 
-impl<'d, T: spim::Instance> Display<'d, T> {
-    unsafe_pinned!(spim: Spim<'d, T>);
-    unsafe_unpinned!(bl1_pin: Output<'static, AnyPin>);
-    unsafe_unpinned!(bl2_pin: Output<'static, AnyPin>);
-    unsafe_unpinned!(bl3_pin: Output<'static, AnyPin>);
-    unsafe_unpinned!(rst_pin: Output<'static, AnyPin>);
-    unsafe_unpinned!(dc_pin: Output<'static, AnyPin>);
-    unsafe_unpinned!(display_on: bool);
-
+impl DisplayFlashSpi {
     pub fn new(
-        bl1_pin: impl PeripheralBorrow<Target = impl GpioPin> + 'd,
-        bl2_pin: impl PeripheralBorrow<Target = impl GpioPin> + 'd,
-        bl3_pin: impl PeripheralBorrow<Target = impl GpioPin> + 'd,
-        spim: impl PeripheralBorrow<Target = T> + 'd,
-        irq: impl PeripheralBorrow<Target = T::Interrupt> + 'd,
-        sck_pin: impl PeripheralBorrow<Target = impl GpioPin> + 'd,
-        mosi_pin: impl PeripheralBorrow<Target = impl GpioPin> + 'd,
-        rst_pin: impl PeripheralBorrow<Target = impl GpioPin> + 'd,
-        cs_pin: impl PeripheralBorrow<Target = impl GpioPin> + 'd,
-        dc_pin: impl PeripheralBorrow<Target = impl GpioPin> + 'd,
+        bl_low_pin: P0_14,
+        bl_mid_pin: P0_22,
+        bl_high_pin: P0_23,
+        spim: TWISPI0,
+        spim_irq: interrupt::SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0,
+        spi_clock_pin: P0_02,
+        spi_mosi_pin: P0_03,
+        spi_miso_pin: P0_04,
+        reset_pin: P0_26,
+        display_cs_pin: P0_25,
+        flash_cs_pin: P0_05,
+        dc_pin: P0_18,
     ) -> Self {
-        unborrow!(bl1_pin, bl2_pin, bl3_pin, rst_pin, cs_pin, dc_pin);
-
-        let config = spim::Config {
-            frequency: spim::Frequency::M8,
-            mode: spim::MODE_3,
-            orc: 122,
-        };
-        let spim = Spim::new(spim, irq, sck_pin, NoPin, mosi_pin, config);
+        let mut bl_low_pin = FlexPin::new(bl_low_pin);
+        let mut bl_mid_pin = FlexPin::new(bl_mid_pin);
+        let mut bl_high_pin = FlexPin::new(bl_high_pin);
+        unwrap!(bl_low_pin.set_low());
+        unwrap!(bl_mid_pin.set_low());
+        unwrap!(bl_high_pin.set_low());
         Self {
-            bl1_pin: Output::new(bl1_pin.degrade(), Level::High, OutputDrive::Standard),
-            bl2_pin: Output::new(bl2_pin.degrade(), Level::High, OutputDrive::Standard),
-            bl3_pin: Output::new(bl3_pin.degrade(), Level::High, OutputDrive::Standard),
+            bl_low_pin,
+            bl_mid_pin,
+            bl_high_pin,
             spim,
-            rst_pin: Output::new(rst_pin.degrade(), Level::Low, OutputDrive::Standard),
-            cs_pin: Output::new(cs_pin.degrade(), Level::Low, OutputDrive::Standard),
-            dc_pin: Output::new(dc_pin.degrade(), Level::Low, OutputDrive::Standard),
-            display_on: false,
-            //marker: PhantomData,
+            spim_irq,
+            spi_clock_pin,
+            spi_mosi_pin,
+            spi_miso_pin,
+            reset_pin,
+            display_cs_pin,
+            flash_cs_pin,
+            dc_pin,
+        }
+    }
+
+    /// Respond to a message in the channel.
+    pub async fn handle(&mut self, cmd: Cmd) {
+        debug!("{:?}", cmd);
+        match cmd {
+            Cmd::SleepOff => self.display().sleep_off().await,
+            Cmd::SleepOn => self.display().sleep_on().await,
+            Cmd::FillRectWithColor { area, color } => {
+                debug!("about to fill");
+                self.display()
+                    .draw_rect_color(area, color.into_storage().to_be_bytes())
+                    .await;
+                debug!("filled");
+            }
+            Cmd::DrawImage {
+                top_left,
+                image,
+                scale,
+            } => self.display().draw_image(top_left, image, scale).await,
+            Cmd::SetBacklight { level } => self.set_backlight(level),
+            Cmd::PowerOn => {
+                self.display().power_on().await;
+                self.set_backlight(Backlight::High);
+                Timer::after(Duration::from_secs(3)).await;
+                self.set_backlight(Backlight::Off);
+            }
+        }
+        debug!("finished cmd");
+    }
+
+    pub fn set_backlight(&mut self, level: Backlight) {
+        use Backlight::*;
+        // TODO remove me once I've checked this actually works.
+        match level {
+            Off => {
+                self.bl_low_pin.set_as_disconnected();
+                self.bl_mid_pin.set_as_disconnected();
+                self.bl_high_pin.set_as_disconnected();
+            }
+            Low => {
+                self.bl_low_pin.set_as_output(OutputDrive::Standard);
+                self.bl_mid_pin.set_as_disconnected();
+                self.bl_high_pin.set_as_disconnected();
+            }
+            Mid => {
+                self.bl_low_pin.set_as_disconnected();
+                self.bl_mid_pin.set_as_output(OutputDrive::Standard);
+                self.bl_high_pin.set_as_disconnected();
+            }
+            High => {
+                self.bl_low_pin.set_as_disconnected();
+                self.bl_mid_pin.set_as_disconnected();
+                self.bl_high_pin.set_as_output(OutputDrive::Standard);
+            }
+        }
+    }
+
+    pub fn display<'a>(&'a mut self) -> Display<'a> {
+        Display::new(
+            &mut self.spim,
+            &mut self.spim_irq,
+            &mut self.spi_clock_pin,
+            &mut self.spi_mosi_pin,
+            &mut self.reset_pin,
+            &mut self.display_cs_pin,
+            &mut self.dc_pin,
+        )
+    }
+}
+
+/// Initialize the display.
+///
+/// The SPI is powered down when this function exits. The backlight is handled separately.
+pub struct Display<'a> {
+    spim: Spim<'a, TWISPI0>,
+    reset_pin: Output<'a, P0_26>,
+    cs_pin: Output<'a, P0_25>,
+    dc_pin: Output<'a, P0_18>,
+}
+
+impl<'a> Display<'a> {
+    fn new(
+        spim: &'a mut TWISPI0,
+        irq: &'a mut interrupt::SPIM0_SPIS0_TWIM0_TWIS0_SPI0_TWI0,
+        sck_pin: &'a mut P0_02,
+        mosi_pin: &'a mut P0_03,
+        reset_pin: &'a mut P0_26,
+        cs_pin: &'a mut P0_25,
+        dc_pin: &'a mut P0_18,
+    ) -> Display<'a> {
+        let mut config = spim::Config::default();
+        config.frequency = spim::Frequency::M8;
+        config.mode = spim::MODE_3;
+        config.orc = 122;
+        let spim = Spim::new(spim, irq, sck_pin, NoPin, mosi_pin, config);
+        let reset_pin = Output::new(reset_pin, Level::High, OutputDrive::Standard);
+        // Drive low to send spi data, then drive high to signal end of data.
+        let cs_pin = Output::new(cs_pin, Level::High, OutputDrive::Standard);
+        // We will always set this before sending a command or data.
+        let dc_pin = Output::new(dc_pin, Level::Low, OutputDrive::Standard);
+        Self {
+            spim,
+            reset_pin,
+            cs_pin,
+            dc_pin,
         }
     }
 
     /// Turns on the screen.
-    pub async fn sleep_off(self: &mut Pin<&mut Self>) {
+    pub async fn sleep_off(&mut self) {
         self.hard_reset().await;
+        unwrap!(self.cs_pin.set_low());
         self.soft_reset().await;
         self.sleep_out().await;
         self.pixel_format(
@@ -131,252 +264,196 @@ impl<'d, T: spim::Instance> Display<'d, T> {
         self.send_command(Instruction::NormalModeOn);
         Timer::after(Duration::from_millis(10)).await;
         self.send_command(Instruction::DisplayOn);
+        unwrap!(self.cs_pin.set_high());
     }
 
-    pub fn set_backlight(&mut self, level: Backlight) {
-        use Backlight::*;
-        match level {
-            Off => {
-                self.bl1_pin.set_high().unwrap();
-                self.bl2_pin.set_high().unwrap();
-                self.bl3_pin.set_high().unwrap();
-            }
-            Low => {
-                self.bl1_pin.set_low().unwrap();
-                self.bl2_pin.set_high().unwrap();
-                self.bl3_pin.set_high().unwrap();
-            }
-            Mid => {
-                self.bl1_pin.set_low().unwrap();
-                self.bl2_pin.set_low().unwrap();
-                self.bl3_pin.set_high().unwrap();
-            }
-            High => {
-                self.bl1_pin.set_low().unwrap();
-                self.bl2_pin.set_low().unwrap();
-                self.bl3_pin.set_low().unwrap();
-            }
-        }
+    pub async fn sleep_on(&mut self) {
+        unwrap!(self.cs_pin.set_low());
+        self.sleep_in().await;
+        unwrap!(self.cs_pin.set_high());
     }
 
     /// Copy a pre-existing buffer of data in RAM onto the screen.
     pub async fn draw_rect_buf(
-        self: &mut Pin<&mut Self>,
-        area: Rect,
+        &mut self,
+        area: Rectangle,
         // This byte array should contain 16 bit Rgb565 colors in big-endian order.
-        mut buf: &[u8],
+        buf: &[u8],
     ) {
-        // TODO check the buffer is in RAM (requirement for DMA).
+        self.draw_rect_iter(area, buf.iter().copied()).await
+    }
 
-        self.set_address_window(
-            area.x0() as u16,
-            area.y0() as u16,
-            // The screen expects the bottom right corner to be inside the Rect, we use the
-            // convention that it is outside.
-            area.x1() as u16 - 1,
-            area.y1() as u16 - 1,
-        );
-
-        self.send_command(Instruction::WriteToRam);
-        // chunk into slices of max EASY_DMA_SIZE
-        for chunk in buf.chunks(EASY_DMA_SIZE) {
-            self.send_data(chunk).await;
+    /// Draw an image at the given location. The image must be [width, height, data...];
+    pub async fn draw_image(&mut self, top_left: Point, buf: &[u8], scale: u8) {
+        struct Scaler<'a> {
+            scale: u8,
+            width: u8,
+            buf: &'a [u8],
+            pos: usize,
         }
+
+        impl<'a> Scaler<'a> {
+            fn new(scale: u8, width: u8, buf: &'a [u8]) -> Self {
+                debug_assert_eq!(buf.len() % width as usize, 0);
+                Scaler {
+                    scale,
+                    width,
+                    buf,
+                    pos: 0,
+                }
+            }
+        }
+
+        impl Iterator for Scaler<'_> {
+            type Item = u8;
+            fn next(&mut self) -> Option<Self::Item> {
+                let width = self.width as usize * self.scale as usize;
+                // pixels come in pairs of bytes (u16).
+                let (pos, byte) = (self.pos / 2, self.pos % 2);
+                let (row, col) = (pos / width, pos % width);
+                let (orig_row, orig_col) = (row / self.scale as usize, col / self.scale as usize);
+                let out = self.buf.get((orig_row * width + orig_col) * 2 + byte);
+                self.pos += 1;
+                out.map(|s| *s)
+            }
+        }
+
+        assert!(scale > 0);
+        let width = buf[0];
+        let height = buf[1];
+        defmt::debug!(
+            "size ({=u8}, {=u8}) orig ({=u8}, {=u8})",
+            width * scale,
+            height * scale,
+            width,
+            height
+        );
+        Timer::after(Duration::from_secs(3)).await;
+        let buf = &buf[2..];
+        let area = Rectangle::new(
+            top_left,
+            Size::new(width as u32 * scale as u32, height as u32 * scale as u32),
+        );
+        self.draw_rect_iter(area, Scaler::new(scale, width, buf))
+            .await
     }
 
     /// Copy data from an iterator onto the screen.
     ///
     /// This method copies into an intermediate buffer.
-    pub async fn draw_rect_iter(
-        self: &mut Pin<&mut Self>,
-        area: Rect,
-        data: impl IntoIterator<Item = u8>,
-    ) {
-        self.set_address_window(
-            area.x0() as u16,
-            area.y0() as u16,
-            // The screen expects the bottom right corner to be inside the Rect, we use the
-            // convention that it is outside.
-            area.x1() as u16 - 1,
-            area.y1() as u16 - 1,
-        );
+    pub async fn draw_rect_iter(&mut self, area: Rectangle, data: impl IntoIterator<Item = u8>) {
+        check_rect_u16(area);
+        let tl = area.top_left;
+        // No area means top-left = bottom-right
+        let br = match area.bottom_right() {
+            Some(x) => x,
+            None => tl,
+        };
 
+        defmt::debug!("set address window");
+        unwrap!(self.cs_pin.set_low());
+        self.set_address_window(tl.x as u16, tl.y as u16, br.x as u16, br.y as u16);
+
+        defmt::debug!("write to ram");
         self.send_command(Instruction::WriteToRam);
         // chunk into slices of max EASY_DMA_SIZE
-        let mut buffer = [0u8; BUFFER_SIZE];
+        let mut buffer = [0u8; crate::EASY_DMA_SIZE];
+        let mut cnt = 0;
         let mut i = 0;
-        for byte in data.into_iter() {
-            buffer[i] = byte;
+        for (idx, byte) in data.into_iter().enumerate() {
+            *unwrap!(buffer.get_mut(i)) = byte;
             i += 1;
-            if i >= BUFFER_SIZE {
-                self.send_data(&buffer).await;
+            if i >= crate::EASY_DMA_SIZE {
+                //defmt::debug!("send buffer {} (idx {=usize})", cnt, idx);
+                self.send_data_blocking(&buffer);
                 i = 0;
+                cnt += 1;
             }
         }
+        defmt::debug!("i = {}", i);
         // send the last buffer
         if i > 0 {
+            //defmt::debug!("send buffer remaining {=usize}", i);
             self.send_data(&buffer[..i]).await;
         }
+        defmt::debug!("pin high");
+        unwrap!(self.cs_pin.set_high());
     }
 
-    /// Draw a filled Rect with the given color.
+    /// Draw a filled Rectangle with the given color.
     ///
     /// This method copies into an intermediate buffer. It assumes that the color has already been
     /// converted into bytes, with the first byte sent on the wire first. (i.e. big endian)
     pub async fn draw_rect_color<const COLOR_BYTES: usize>(
-        self: &mut Pin<&mut Self>,
-        area: Rect,
+        &mut self,
+        area: Rectangle,
         color: [u8; COLOR_BYTES],
     ) {
-        // we don't support 8 bit arch. TODO static assert this.
         self.draw_rect_iter(
             area,
             iter::repeat(&color)
-                .take(area.area() as usize)
+                .take((area.size.width * area.size.height) as usize)
                 .flatten()
                 .copied(),
+        )
+        .await;
+    }
+
+    pub async fn clear(&mut self, color: Rgb565) {
+        self.draw_rect_color(
+            Rectangle::new(Point::new(0, 0), Size::new(240, 240)),
+            color.into_storage().to_be_bytes(),
         )
         .await
     }
 
-    /*
-        #[inline]
-        /// Clear the display to the selected color, batching pixels for speed.
-        pub async fn clear(self: &mut Pin<&mut Self>, color: Rgb565) {
-            self.clear_rect(color, DISPLAY_AREA).await
-        }
+    pub async fn power_on(&mut self) {
+        self.sleep_off();
+        // clear screen
+        self.clear(Rgb565::WHITE).await;
+    }
 
-        /// Clear the display to the selected color, batching pixels for speed.
-        pub async fn clear_rect(self: &mut Pin<&mut Self>, color: Rgb565, rect: Rectangle) {
-            let rect = intersect(rect, DISPLAY_AREA);
-            if area(rect) == 0 {
-                // nothing to do
-                return;
-            }
-            let color = (RawU16::from(color).into_inner()).to_be_bytes();
-            //rprintln!("fill {:?}", color);
-            let mut buffer = [0u8; BUFFER_SIZE];
-
-            self.set_address_window(
-                rect.top_left.x as u16,
-                rect.top_left.y as u16,
-                rect.bottom_right.x as u16 - 1,
-                rect.bottom_right.y as u16 - 1,
-            );
-            self.send_command(Instruction::WriteToRam);
-
-            let display_bytes = area(rect).max(0) as usize * 2;
-            let mut data_sent = 0;
-            loop {
-                //rprintln!("{} - {} <= {}", display_bytes, data_sent, BUFFER_SIZE);
-                if display_bytes - data_sent <= BUFFER_SIZE {
-                    let mut i = 0;
-                    while i < display_bytes - data_sent {
-                        debug_assert!(i < BUFFER_SIZE - 1);
-                        buffer[i] = color[0];
-                        buffer[i + 1] = color[1];
-                        i += 2;
-                    }
-                    self.send_data(&buffer[..i]).await;
-                    break;
-                } else {
-                    // manual loop to step 2
-                    let mut i = 0;
-                    while i < BUFFER_SIZE {
-                        debug_assert!(i < BUFFER_SIZE - 1);
-                        buffer[i] = color[0];
-                        buffer[i + 1] = color[1];
-                        i += 2;
-                    }
-                    self.send_data(&buffer).await;
-                    data_sent += BUFFER_SIZE;
-                }
-            }
-        }
-
-        /// Draw pixels to a rectangular area of the screen.
-        pub async fn draw_rect(
-            self: &mut Pin<&mut Self>,
-            rect: Rectangle,
-            colors: impl Iterator<Item = Rgb565>,
-        ) {
-            let rect = intersect(rect, DISPLAY_AREA);
-            if area(rect) == 0 {
-                // nothing to do
-                return;
-            }
-            let color = (RawU16::from(color).into_inner()).to_be_bytes();
-            //rprintln!("fill {:?}", color);
-            let mut buffer = [0u8; BUFFER_SIZE];
-
-            self.set_address_window(
-                rect.top_left.x as u16,
-                rect.top_left.y as u16,
-                rect.bottom_right.x as u16 - 1,
-                rect.bottom_right.y as u16 - 1,
-            );
-            self.send_command(Instruction::WriteToRam);
-
-            let display_bytes = area(rect).max(0) as usize * 2;
-            let mut data_sent = 0;
-            loop {
-                //rprintln!("{} - {} <= {}", display_bytes, data_sent, BUFFER_SIZE);
-                if display_bytes - data_sent <= BUFFER_SIZE {
-                    let mut i = 0;
-                    while i < display_bytes - data_sent {
-                        debug_assert!(i < BUFFER_SIZE - 1);
-                        buffer[i] = color[0];
-                        buffer[i + 1] = color[1];
-                        i += 2;
-                    }
-                    self.send_data(&buffer[..i]).await;
-                    break;
-                } else {
-                    // manual loop to step 2
-                    let mut i = 0;
-                    while i < BUFFER_SIZE {
-                        debug_assert!(i < BUFFER_SIZE - 1);
-                        buffer[i] = color[0];
-                        buffer[i + 1] = color[1];
-                        i += 2;
-                    }
-                    self.send_data(&buffer).await;
-                    data_sent += BUFFER_SIZE;
-                }
-            }
-        }
-    */
-
-    // Commands and their args.
+    // Display commands and their args.
 
     #[inline]
-    async fn hard_reset(self: &mut Pin<&mut Self>) {
-        self.as_mut().rst_pin().set_high().unwrap();
+    async fn hard_reset(&mut self) {
+        //debug!("hard_reset");
+        unwrap!(self.reset_pin.set_high());
         Timer::after(Duration::from_micros(10)).await;
-        self.as_mut().rst_pin().set_low().unwrap();
+        unwrap!(self.reset_pin.set_low());
         Timer::after(Duration::from_micros(10)).await;
-        self.as_mut().rst_pin().set_high().unwrap();
+        unwrap!(self.reset_pin.set_high());
         Timer::after(Duration::from_micros(10)).await;
     }
 
     #[inline]
-    async fn soft_reset(self: &mut Pin<&mut Self>) {
+    async fn soft_reset(&mut self) {
+        //debug!("soft_reset");
         self.send_command(Instruction::SoftwareReset);
         Timer::after(Duration::from_millis(150)).await;
     }
 
     #[inline]
-    async fn sleep_out(self: &mut Pin<&mut Self>) {
+    async fn sleep_out(&mut self) {
+        //debug!("sleep_out");
         self.send_command(Instruction::SleepOut);
         Timer::after(Duration::from_millis(10)).await;
     }
 
     #[inline]
+    async fn sleep_in(&mut self) {
+        //debug!("sleep_out");
+        self.send_command(Instruction::SleepIn);
+        Timer::after(Duration::from_millis(10)).await;
+    }
+
+    #[inline]
     fn pixel_format(
-        self: &mut Pin<&mut Self>,
+        &mut self,
         color: RgbInterfaceColorFormat,
         ctrl: ControlInterfaceColorFormat, // this is the one that we use I think
     ) {
+        //debug!("pixel_format");
         // 16bit 65k colors
         self.send_command(Instruction::InterfacePixelFormat);
         self.send_data_blocking(&[color as u8 | ctrl as u8]);
@@ -384,7 +461,7 @@ impl<'d, T: spim::Instance> Display<'d, T> {
 
     /// Invert the colors of the display, so e.g. red would become cyan.
     #[inline]
-    async fn invert_display(self: &mut Pin<&mut Self>, invert: bool) {
+    async fn invert_display(&mut self, invert: bool) {
         if invert {
             self.send_command(Instruction::DisplayInversionOn);
         } else {
@@ -395,11 +472,12 @@ impl<'d, T: spim::Instance> Display<'d, T> {
 
     #[inline]
     fn vertical_scrolling_definition(
-        self: &mut Pin<&mut Self>,
+        &mut self,
         top_fixed_area: u16,
         vertical_scrolling_area: u16,
         bottom_fixed_area: u16,
     ) {
+        //debug!("vertical_scrolling_definition");
         debug_assert_eq!(
             top_fixed_area + vertical_scrolling_area + bottom_fixed_area,
             320
@@ -414,7 +492,7 @@ impl<'d, T: spim::Instance> Display<'d, T> {
 
     #[inline]
     fn memory_data_access_control(
-        self: &mut Pin<&mut Self>,
+        &mut self,
         page_address_order: ColDir,
         column_address_order: RowDir,
         page_col_order_reverse: bool,
@@ -422,7 +500,7 @@ impl<'d, T: spim::Instance> Display<'d, T> {
         color_order: ColorOrder,
         display_data_latch_order: RowDir,
     ) {
-        // let's hope this all disappears through optimization
+        // let's hope this all disappears through optimization (constant propagation)
         let mut mdac = 0;
         if matches!(page_address_order, ColDir::BottomToTop) {
             mdac |= 1 << 7;
@@ -447,13 +525,7 @@ impl<'d, T: spim::Instance> Display<'d, T> {
     }
 
     #[inline]
-    fn set_address_window(
-        self: &mut Pin<&mut Self>,
-        startx: u16,
-        starty: u16,
-        endx: u16,
-        endy: u16,
-    ) {
+    fn set_address_window(&mut self, startx: u16, starty: u16, endx: u16, endy: u16) {
         // The screen we use (ST7789) actually has video memory that is slightly bigger than the
         // screen, and supports scrolling. I think this is there to mean you can update the image
         // faster than you can write data to it using the SPI.
@@ -476,7 +548,7 @@ impl<'d, T: spim::Instance> Display<'d, T> {
     }
 
     #[inline]
-    fn vertical_scroll_start_address(self: &mut Pin<&mut Self>, line: u16) {
+    fn vertical_scroll_start_address(&mut self, line: u16) {
         self.send_command(Instruction::VerticalScrollStartAddress);
         self.send_data_blocking(&line.to_be_bytes());
     }
@@ -484,21 +556,36 @@ impl<'d, T: spim::Instance> Display<'d, T> {
     // raw methods for commands & data
 
     #[inline]
-    fn send_command(self: &mut Pin<&mut Self>, inst: Instruction) {
-        self.as_mut().dc_pin().set_low().unwrap();
-        self.as_mut().spim().write_blocking(&[inst.into()]).unwrap();
+    fn send_command(&mut self, inst: Instruction) {
+        unwrap!(self.dc_pin.set_low());
+        unwrap!(embedded_hal::blocking::spi::Write::write(
+            &mut self.spim,
+            &[inst.into()]
+        ));
     }
 
     #[inline]
-    fn send_data_blocking(self: &mut Pin<&mut Self>, data: &[u8]) {
-        self.as_mut().dc_pin().set_high().unwrap();
-        self.as_mut().spim().write_blocking(data).unwrap();
+    fn send_data_blocking(&mut self, data: &[u8]) {
+        unwrap!(self.dc_pin.set_high());
+        unwrap!(embedded_hal::blocking::spi::Write::write(
+            &mut self.spim,
+            data
+        ));
     }
 
     #[inline]
-    async fn send_data(self: &mut Pin<&mut Self>, data: &[u8]) {
-        self.as_mut().dc_pin().set_high().unwrap();
-        self.as_mut().spim().write(data).await.unwrap();
+    async fn send_data(&mut self, data: &[u8]) {
+        /*
+        defmt::debug!(
+            "writing data at {=usize:x} -> {=usize:x}",
+            data.as_ptr() as _,
+            (data.as_ptr() as usize) + data.len()
+        );
+        */
+        unwrap!(self.dc_pin.set_high());
+        //defmt::debug!("let's go");
+        unwrap!(self.spim.write(data).await);
+        //defmt::debug!("write finished");
     }
 }
 
@@ -565,20 +652,22 @@ impl Into<u8> for Instruction {
     }
 }
 
-fn intersect(rect1: Rectangle, rect2: Rectangle) -> Rectangle {
-    Rectangle {
-        top_left: Point {
-            x: rect1.top_left.x.max(rect2.top_left.x),
-            y: rect1.top_left.y.max(rect2.top_left.y),
-        },
-        bottom_right: Point {
-            x: rect1.bottom_right.x.min(rect2.bottom_right.x),
-            y: rect1.bottom_right.y.min(rect2.bottom_right.y),
-        },
-    }
-}
-
-fn area(rect: Rectangle) -> i32 {
-    let area = (rect.bottom_right.x - rect.top_left.x) * (rect.bottom_right.y - rect.top_left.y);
-    area.max(0)
+fn check_rect_u16(r: Rectangle) {
+    let tl = r.top_left;
+    // No area means top-left = bottom-right
+    let br = match r.bottom_right() {
+        Some(x) => x,
+        None => tl,
+    };
+    let max = u16::MAX as i32;
+    defmt::assert!(
+        tl.x >= 0
+            && tl.x <= max
+            && tl.y >= 0
+            && tl.y <= max
+            && br.x >= 0
+            && br.x <= max
+            && br.y >= 0
+            && br.y <= max
+    );
 }

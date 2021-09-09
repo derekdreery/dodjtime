@@ -8,6 +8,7 @@
 //!
 //! Use signed integers so we can have shapes that go offscreen. The offscreen bits won't be drawn.
 
+#![allow(incomplete_features)]
 #![feature(const_generics)]
 #![feature(const_evaluatable_checked)]
 #![no_std]

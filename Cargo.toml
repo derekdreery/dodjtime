@@ -6,25 +6,47 @@ edition = "2018"
 resolver = "2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+
+default = [
+  "defmt-default"
+]
+
+# do NOT modify these features
+defmt-default = []
+defmt-trace = []
+defmt-debug = []
+defmt-info = []
+defmt-warn = []
+defmt-error = []
+
 
 [dependencies]
 #nrf52832-hal = { version = "0.12.1", features = ["rt"] }
-#embedded-hal = { version = "0.2.4", features = ["unproven"] }
+embedded-hal = { version = "0.2.4" }
 cortex-m = "0.7.1"
 cortex-m-rt = { version = "0.6.13", features = ["device"] }
-rtt-target = { version = "0.3.0", features = ["cortex-m"] }
+#rtt-target = { version = "0.3.0", features = ["cortex-m"] }
 #display-interface-spi = "0.4.0"
 #st7789 = "0.5.0"
-embedded-graphics = "0.6.2"
+embedded-graphics = { path = "../../contrib/embedded-graphics", features = ["defmt_support"]}
 heapless = "0.6.1"
 chrono = { version = "0.4.19", default-features = false }
-embassy = { path = "../../contrib/embassy/embassy" }
-embassy-extras = { path = "../../contrib/embassy/embassy-extras" }
-embassy-nrf = { path = "../../contrib/embassy/embassy-nrf", features = ["52832"] }
+embassy = { path = "../../contrib/embassy/embassy", features = ["defmt"] }
+#embassy-extras = { path = "../../contrib/embassy/embassy-extras", features = ["defmt"] }
+embassy-nrf = { path = "../../contrib/embassy/embassy-nrf", features = ["nrf52832", "defmt", "time-driver-rtc1", "gpiote", "defmt-trace"] }
 pin-utils = "0.1.0"
 futures = { version = "0.3.13", default-features = false, features = ["async-await"] }
-enigita = { version = "0.1.0", path = "enigita" }
+#enigita = { version = "0.1.0", path = "enigita" }
+nrf-softdevice-s112 = { version = "0.1.1", path = "../../contrib/nrf-softdevice/nrf-softdevice-s112" }
+defmt-rtt = { version = "0.2.0"}
+defmt = { version = "0.2.3"} 
+panic-abort = "0.3.2"
 
+[dependencies.nrf-softdevice] 
+version = "0.1.0"
+path = "../../contrib/nrf-softdevice/nrf-softdevice"
+features = ["nrf52832", "s112", "ble-peripheral" ,"defmt", "defmt-trace"]
 
 #[build-dependencies]
 #enigita-compiletime = { version = "0.1.0", path = "enigita/enigita-compiletime" }
@@ -32,10 +54,37 @@ enigita = { version = "0.1.0", path = "enigita" }
 #anyhow = "1.0.40"
 
 [patch.crates-io]
-#nrf52832-hal = { path = "../../contrib/nrf-hal/nrf52832-hal" }
+embassy = { path = "../../contrib/embassy/embassy" }
+nrf-softdevice = { path = "../../contrib/nrf-softdevice/nrf-softdevice" }
 
+# We need optimizations, even in debug mode.
+
+[profile.dev]
+codegen-units = 1
+debug = 0
+debug-assertions = true # <-
+incremental = false
+opt-level = 2 # <-
+overflow-checks = true # <-
+
+# cargo test
+[profile.test]
+codegen-units = 1
+debug = 2
+debug-assertions = true # <-
+incremental = false
+opt-level = 3 # <-
+overflow-checks = true # <-
+
+# cargo build/run --release
 [profile.release]
-#debug = true
+codegen-units = 1
+debug = 2
+debug-assertions = false # <-
+incremental = false
+lto = 'fat'
+opt-level = 3 # <-
+overflow-checks = false # <-
 
 [workspace]
 members = [
