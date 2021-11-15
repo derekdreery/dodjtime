@@ -1,12 +1,20 @@
-use ab_glyph::{Font, FontArc, PxScale, PxScaleFont, ScaleFont};
+use ab_glyph::{Font, FontArc, GlyphId, PxScale, PxScaleFont, ScaleFont};
 use qu::ick_use::*;
-use std::{fmt, fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, fs,
+    path::PathBuf,
+};
+
+mod gen;
 
 #[derive(Debug, StructOpt)]
 struct Opt {
     #[structopt(parse(from_os_str))]
     font_file: PathBuf,
     point_size: f32,
+    #[structopt(parse(from_os_str))]
+    output_file: Option<PathBuf>,
 }
 
 struct DisplayFont<'a, F>(&'a F);
@@ -50,6 +58,11 @@ fn main(opt: Opt) -> Result {
     log::info!("calculated scale: {:?}", scale);
     let font = font.into_scaled(scale);
     log::info!("{}", DisplayFontScaled(&font));
+    let kern_table = collect_kerning_table(&font);
+    log::info!("kerning table: {:?}", kern_table);
+    if kern_table.is_empty() {
+        log::warn!("kerning table ignored");
+    }
 
     let mut buf: Vec<u8> = Vec::new();
     for ch in
@@ -94,27 +107,6 @@ fn main(opt: Opt) -> Result {
         debug_render(&data, width);
         // offset from baseline to draw glyph.
         let origin = bounds.min;
-        /*
-        buf.extend(array::IntoIter::new(
-            u16::try_from(size.width())
-                .context("converting width")?
-                .to_be_bytes(),
-        ));
-        buf.extend(array::IntoIter::new(
-            u16::try_from(size.height())
-                .context("converting height")?
-                .to_be_bytes(),
-        ));
-        let area = size.width() as usize * size.height() as usize;
-        // one bit per pixel.
-        println!("letter {}", ch);
-        let mut acc = 0;
-
-        glyph.draw(|x, y, amt| {
-            println!("  ({},{}) -> {}", x, y, amt);
-            acc += 1;
-        });
-        */
     }
     Ok(())
 }
@@ -148,4 +140,26 @@ fn debug_render(data: &[f32], width: usize) {
         }
     }
     println!();
+}
+
+fn collect_glyphs(font: &impl Font) -> HashSet<GlyphId> {
+    let mut set = HashSet::new();
+    for (id, _) in font.codepoint_ids() {
+        set.insert(id);
+    }
+    set
+}
+
+fn collect_kerning_table(font: &PxScaleFont<impl Font>) -> HashMap<(GlyphId, GlyphId), f32> {
+    let glyphs = collect_glyphs(font.font());
+    let mut kern_table = HashMap::new();
+    for g1 in glyphs.iter().copied() {
+        for g2 in glyphs.iter().copied() {
+            let kern = font.kern(g1, g2);
+            if kern != 0. {
+                kern_table.insert((g1, g2), kern);
+            }
+        }
+    }
+    kern_table
 }
