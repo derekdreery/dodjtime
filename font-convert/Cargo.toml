@@ -9,5 +9,5 @@ edition = "2018"
 [dependencies]
 font-kit = "0.10.0"
 structopt = "0.3.21"
-rusttype = "0.9.2"
-qu = "0.2.1"
+qu = "0.3.1"
+ab_glyph = "0.2.12"
