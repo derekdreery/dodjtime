@@ -3,18 +3,24 @@
 #![allow(incomplete_features)]
 #![allow(dead_code)]
 #![feature(type_alias_impl_trait)]
+#![feature(const_generics_defaults)]
 
 extern crate panic_abort;
 
+#[cfg(not(target_pointer_width = "32"))]
+compile_error!("code assumes pointer width is 32 bits");
+
 use cortex_m_rt::{entry, exception, ExceptionFrame};
-use defmt::{debug, error, unwrap, Format};
+use defmt::{unwrap, Format};
 use defmt_rtt as _;
 use embassy::{
+    blocking_mutex::kind::CriticalSection,
+    channel::mpsc,
     executor::{Executor, Spawner},
     interrupt::InterruptExt,
     task,
     time::{Duration, Timer},
-    util::{mpsc, Forever},
+    util::Forever,
 };
 use embassy_nrf::{
     gpiote,
@@ -30,6 +36,7 @@ use embedded_graphics::{
     primitives::Rectangle,
 };
 use futures::prelude::*;
+use heapless::String;
 use nrf_softdevice::{ble, Softdevice};
 use pin_utils::pin_mut;
 
@@ -51,10 +58,13 @@ const BG_IMAGE: &[u8] = include_bytes!("../data/pictures/clock_bg.rgb565");
 static EXECUTOR: Forever<Executor> = Forever::new();
 static BATTERY_CHANNEL: Forever<battery::Channel> = Forever::new();
 static DISPLAY_FLASH_CHANNEL: Forever<display::Channel> = Forever::new();
-static MAIN_CHANNEL: Forever<Channel> = Forever::new();
+static MAIN_CHANNEL: Forever<Channel<Cmd>> = Forever::new();
 
-type Channel = mpsc::Channel<mpsc::WithNoThreads, Cmd, CHANNEL_SIZE>;
-type Sender<'ch> = mpsc::Sender<'ch, mpsc::WithNoThreads, Cmd, CHANNEL_SIZE>;
+type Channel<C, M = CriticalSection, const S: usize = CHANNEL_SIZE> = mpsc::Channel<M, C, S>;
+type Sender<'ch, C, M = CriticalSection, const S: usize = CHANNEL_SIZE> =
+    mpsc::Sender<'ch, M, C, S>;
+type Receiver<'ch, C, M = CriticalSection, const S: usize = CHANNEL_SIZE> =
+    mpsc::Receiver<'ch, M, C, S>;
 
 /// Commands that can be sent to the main task
 #[derive(Format)]
@@ -90,7 +100,7 @@ fn main() -> ! {
         );
 
         // Setup battery task
-        let battery_channel = BATTERY_CHANNEL.put(battery::Channel::new());
+        let mut battery_channel = BATTERY_CHANNEL.put(battery::Channel::new());
         let (battery_sender, battery_receiver) = mpsc::split(battery_channel);
         let saadc_irq = interrupt::take!(SAADC);
         saadc_irq.set_priority(Priority::P2);
@@ -100,7 +110,7 @@ fn main() -> ! {
         let (main_sender, main_receiver) = mpsc::split(main_channel);
 
         // Tick tock
-        unwrap!(spawner.spawn(alive()));
+        //unwrap!(spawner.spawn(alive()));
         // Start the SoftDevice
         //unwrap!(spawner.spawn(softdevice_task(softdev)));
         // Start power button task
@@ -125,6 +135,7 @@ fn main() -> ! {
     });
 }
 
+/*
 #[task]
 async fn alive() {
     let mut cnt = 0;
@@ -134,6 +145,7 @@ async fn alive() {
         cnt += 1;
     }
 }
+*/
 
 #[task]
 async fn softdevice_task(sd: &'static Softdevice) {
@@ -146,7 +158,7 @@ async fn softdevice_task(sd: &'static Softdevice) {
 #[task]
 async fn display_flash_task(
     mut display: DisplayFlashSpi,
-    mut channel: mpsc::Receiver<'static, mpsc::WithNoThreads, display::Cmd, CHANNEL_SIZE>,
+    mut channel: Receiver<'static, display::Cmd>,
 ) {
     while let Some(cmd) = channel.recv().await {
         display.handle(cmd).await;
@@ -154,7 +166,7 @@ async fn display_flash_task(
 }
 
 #[task]
-async fn power_button_task(mut p0_15: P0_15, mut p0_13: P0_13, channel: Sender<'static>) {
+async fn power_button_task(mut p0_15: P0_15, mut p0_13: P0_13, channel: Sender<'static, Cmd>) {
     use embassy::{
         time::{Duration, Timer},
         traits::gpio::{WaitForHigh, WaitForLow},
@@ -191,8 +203,8 @@ async fn battery_task(
     irq: interrupt::SAADC,
     level_pin: P0_31,
     source_pin: P0_12,
-    mut cmd_in: mpsc::Receiver<'static, mpsc::WithNoThreads, battery::Cmd, CHANNEL_SIZE>,
-    cmd_out: Sender<'static>,
+    mut cmd_in: Receiver<'static, battery::Cmd>,
+    cmd_out: Sender<'static, Cmd>,
 ) {
     let mut battery = Battery::new(adc, irq, level_pin, source_pin);
     // Only 1 command for now
@@ -210,7 +222,7 @@ async fn battery_task(
 // commands to other tasks, and have a mpsc channel to collect things to handle from other tasks.
 #[task]
 async fn main_task(
-    mut main_channel: mpsc::Receiver<'static, mpsc::WithNoThreads, Cmd, CHANNEL_SIZE>,
+    mut main_channel: Receiver<'static, Cmd>,
     display_channel: display::Sender<'static>,
     battery_channel: battery::Sender<'static>,
     /*softdev: &'static Softdevice,*/
@@ -236,7 +248,7 @@ async fn main_task(
     //ble::advertise(softdevice);
 
     /* powerup indication */
-    unwrap!(display_channel.send(display::Cmd::PowerOn).await);
+    //unwrap!(display_channel.send(display::Cmd::PowerOn).await);
 
     let mut cnt = 0;
     loop {
@@ -246,7 +258,6 @@ async fn main_task(
                 cnt += 1;
                 unwrap!(battery_channel.send(battery::Cmd::SampleBattery).await);
                 defmt::info!("show some stuff");
-                // TODO don't sleep in the main thread, this is just for an example for now.
                 //debug!("sleep off");
                 unwrap!(display_channel.send(display::Cmd::SleepOff).await);
 
@@ -262,11 +273,20 @@ async fn main_task(
                 defmt::debug!("draw image");
                 unwrap!(
                     display_channel
-                        .send(display::Cmd::DrawImage {
-                            top_left: Point::new(0, 0),
-                            image: BG_IMAGE,
-                            scale: 1,
-                        })
+                        .send(display::Cmd::draw_image(Point::new(2, 2), BG_IMAGE, 4,))
+                        .await
+                );
+                unwrap!(
+                    display_channel
+                        .send(display::Cmd::draw_text(
+                            Point::new(0, 0),
+                            {
+                                let mut s = String::new();
+                                unwrap!(s.push_str("12:32"));
+                                s
+                            },
+                            5,
+                        ))
                         .await
                 );
                 defmt::debug!("backlight up");
@@ -279,6 +299,7 @@ async fn main_task(
                 );
                 // This waits 5 secs after the message was sent - not necessarily the same as when
                 // the operation was completed (TODO).
+                // TODO don't sleep in the main thread, this is just for an example for now.
                 Timer::after(Duration::from_secs(5)).await;
                 unwrap!(
                     display_channel
@@ -380,6 +401,6 @@ async fn main_task(
 
 #[exception]
 fn HardFault(ef: &ExceptionFrame) -> ! {
-    error!("HardFault");
+    defmt::error!("HardFault");
     loop {}
 }

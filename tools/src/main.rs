@@ -1,3 +1,6 @@
+mod font;
+
+use crate::font::convert_font;
 use image::{DynamicImage, GenericImageView, Pixel};
 use qu::ick_use::*;
 use std::{
@@ -27,6 +30,29 @@ enum Cmd {
         #[structopt(long, short, parse(try_from_str))]
         size: Option<Size>,
     },
+    /// Converts a font into the format we expect. Outputs rust code.
+    ConvertFont(ConvertFont),
+}
+
+#[derive(StructOpt)]
+struct ConvertFont {
+    /// The location of the original png
+    #[structopt(parse(from_os_str))]
+    src: PathBuf,
+    /// The location of the original extents
+    ///
+    /// The extents are the advances - nothing fancy here. One number per line
+    #[structopt(parse(from_os_str))]
+    extents_src: PathBuf,
+    /// The location to put the converted font data.
+    #[structopt(parse(from_os_str))]
+    dst: PathBuf,
+    /// The height of the font. Defaults to the height of the image.
+    #[structopt(long)]
+    height: Option<u32>,
+    /// Print the given character. This is for testing.
+    #[structopt(long)]
+    print_char: Option<char>,
 }
 
 pub struct Size {
@@ -41,7 +67,7 @@ impl FromStr for Size {
         let re = regex::Regex::new(r"^(\d+)x?(\d+)$").unwrap();
         let caps = re
             .captures(input)
-            .ok_or(format_err!("input does look like a size (like nxn)"))?;
+            .ok_or(format_err!("input does not look like a size (like nxn)"))?;
         Ok(Size {
             width: caps.get(1).unwrap().as_str().parse()?,
             height: caps.get(2).unwrap().as_str().parse()?,
@@ -53,16 +79,13 @@ impl FromStr for Size {
 fn main(opt: Opt) -> Result {
     match opt.cmd {
         Cmd::ConvertImage { src, dst, size } => convert_image(src, dst, size)?,
+        Cmd::ConvertFont(config) => convert_font(config)?,
     }
     Ok(())
 }
 
 fn convert_image(src: PathBuf, dst: PathBuf, size: Option<Size>) -> Result {
-    fn load_image(path: &Path) -> Result<DynamicImage> {
-        Ok(image::io::Reader::open(path)?.decode()?)
-    }
-    let src =
-        load_image(&src).context(format!("could not read src image \"{}\"", src.display()))?;
+    let src = load_image(&src)?;
 
     if let Some(size) = size {
         if src.dimensions() != (size.width, size.height) {
@@ -103,4 +126,12 @@ fn image_to_bytes_rgb565(img: &DynamicImage) -> Vec<u8> {
         // ignore alpha (unsupported)
     }
     output
+}
+
+fn load_image(path: &Path) -> Result<DynamicImage> {
+    #[inline]
+    fn load_image_inner(path: &Path) -> Result<DynamicImage> {
+        Ok(image::io::Reader::open(path)?.decode()?)
+    }
+    load_image_inner(path).context(format!("could not read src image \"{}\"", path.display()))
 }

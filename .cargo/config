@@ -2,7 +2,7 @@
 target = "thumbv7em-none-eabihf"
 
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-runner = 'arm-none-eabi-gdb'
+runner = 'probe-run --chip nRF52832_xxAA'
 rustflags = [
     "-C", "link-arg=--nmagic",
     "-C", "link-arg=-Tlink.x",

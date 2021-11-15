@@ -1,6 +1,6 @@
 use core::fmt;
 use defmt::Format;
-use embassy::util::mpsc;
+use embassy::channel::mpsc;
 use embassy_nrf::{interrupt as i, peripherals as p};
 use embedded_hal::digital::v2::InputPin;
 use futures::pin_mut;
@@ -12,8 +12,9 @@ pub enum Cmd {
     SampleBattery,
 }
 
-pub type Channel = mpsc::Channel<mpsc::WithNoThreads, Cmd, { crate::CHANNEL_SIZE }>;
-pub type Sender<'ch> = mpsc::Sender<'ch, mpsc::WithNoThreads, Cmd, { crate::CHANNEL_SIZE }>;
+pub type Channel = crate::Channel<Cmd>;
+pub type Sender<'ch> = crate::Sender<'ch, Cmd>;
+pub type Receiver<'ch> = crate::Receiver<'ch, Cmd>;
 
 #[derive(Format)]
 pub struct State {
@@ -48,19 +49,24 @@ impl Battery {
     /// Get remaining charge
     pub async fn level(&mut self) -> Level {
         use embassy_nrf::saadc::{
-            Config, Gain, OneShot, Oversample, Reference, Resolution, Sample, Time,
+            ChannelConfig, Config, Gain, Oversample, Reference, Resolution, Saadc, Time,
         };
-        let config = Config {
-            resolution: Resolution::_12BIT,
-            oversample: Oversample::BYPASS,
-            reference: Reference::INTERNAL,
-            gain: Gain::GAIN1_5,
-            time: Time::_3US,
-            ..Default::default()
-        };
-        let adc = OneShot::new(&mut self.adc, &mut self.irq, config);
+
+        let mut config = Config::default();
+        config.resolution = Resolution::_12BIT;
+        config.oversample = Oversample::BYPASS;
+
+        let mut chan_cfg = ChannelConfig::single_ended(&mut self.level_pin);
+        chan_cfg.reference = Reference::INTERNAL;
+        chan_cfg.gain = Gain::GAIN1_5;
+        chan_cfg.time = Time::_3US;
+        // no pull-up/down
+
+        let adc = Saadc::new(&mut self.adc, &mut self.irq, config, [chan_cfg]);
         pin_mut!(adc);
-        let sample = adc.as_mut().sample(&mut self.level_pin).await;
+        let mut sample = [0i16; 1];
+        adc.as_mut().sample(&mut sample).await;
+        let sample = sample[0];
         // Result = vin * (gain / reference) * 2 ** (resolution)
         //        = vin * (0.2 / 0.6) * (2 ** 12)
         //        = vin * 1365

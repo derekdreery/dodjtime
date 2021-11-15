@@ -1,9 +1,9 @@
 use core::iter;
-use defmt::{assert, debug, panic, unwrap, Format};
+use defmt::{assert, panic, unwrap, Format};
 use embassy::{
+    channel::mpsc,
     time::{Duration, Timer},
     traits::spi::{FullDuplex, Write},
-    util::mpsc,
 };
 use embassy_nrf::{
     gpio::{FlexPin, Level, NoPin, Output, OutputDrive},
@@ -12,12 +12,17 @@ use embassy_nrf::{
     spim::{self, Spim},
 };
 use embedded_hal::digital::v2::OutputPin;
+use heapless::String;
 
 pub use embedded_graphics::{
     geometry::{Point, Size},
     pixelcolor::{IntoStorage, Rgb565, RgbColor},
     primitives::Rectangle,
 };
+
+mod text;
+
+use self::text::FONT;
 
 const DISPLAY_WIDTH: usize = 240;
 const DISPLAY_HEIGHT: usize = 240;
@@ -37,11 +42,10 @@ pub enum Cmd {
         /// The color to fill it with
         color: Rgb565,
     },
-    DrawImage {
-        top_left: Point,
-        image: &'static [u8],
-        scale: u8,
-    },
+    /// Draw an image to screen
+    DrawImage { image: PlacedImage },
+    /// Draw text to screen
+    DrawText { text: PlacedText, bg: TextBg },
     /// Change the backlight level
     SetBacklight { level: Backlight },
     /// A high-level command to display a power on indicator.
@@ -53,10 +57,63 @@ impl Cmd {
     pub fn fill_rect_with_color(area: Rectangle, color: Rgb565) -> Self {
         Self::FillRectWithColor { area, color }
     }
+
+    pub fn draw_image(top_left: Point, data: &'static [u8], scale: u8) -> Self {
+        Cmd::DrawImage {
+            image: PlacedImage::new(top_left, data, scale),
+        }
+    }
+
+    pub fn draw_text(top_left: Point, text: String<16>, scale: u8) -> Self {
+        Cmd::DrawText {
+            text: PlacedText::new(top_left, text, scale),
+            bg: TextBg::Color(Rgb565::BLACK),
+        }
+    }
 }
 
-pub type Channel = mpsc::Channel<mpsc::WithNoThreads, Cmd, { crate::CHANNEL_SIZE }>;
-pub type Sender<'ch> = mpsc::Sender<'ch, mpsc::WithNoThreads, Cmd, { crate::CHANNEL_SIZE }>;
+#[derive(Format)]
+pub enum TextBg {
+    Color(Rgb565),
+    Image(PlacedImage),
+}
+
+#[derive(Format)]
+pub struct PlacedImage {
+    pub top_left: Point,
+    pub data: &'static [u8],
+    pub scale: u8,
+}
+
+impl PlacedImage {
+    pub fn new(top_left: Point, data: &'static [u8], scale: u8) -> Self {
+        PlacedImage {
+            top_left,
+            data,
+            scale,
+        }
+    }
+}
+
+#[derive(Format)]
+pub struct PlacedText {
+    pub top_left: Point,
+    pub text: String<16>,
+    pub scale: u8,
+}
+
+impl PlacedText {
+    pub fn new(top_left: Point, text: String<16>, scale: u8) -> Self {
+        PlacedText {
+            top_left,
+            text,
+            scale,
+        }
+    }
+}
+
+pub type Channel = crate::Channel<Cmd>;
+pub type Sender<'ch> = crate::Sender<'ch, Cmd>;
 
 /// A display & nor flash driver hard-coded to the PineTime.
 ///
@@ -136,22 +193,26 @@ impl DisplayFlashSpi {
 
     /// Respond to a message in the channel.
     pub async fn handle(&mut self, cmd: Cmd) {
-        debug!("{:?}", cmd);
+        defmt::debug!("{:?}", cmd);
         match cmd {
             Cmd::SleepOff => self.display().sleep_off().await,
             Cmd::SleepOn => self.display().sleep_on().await,
             Cmd::FillRectWithColor { area, color } => {
-                debug!("about to fill");
                 self.display()
                     .draw_rect_color(area, color.into_storage().to_be_bytes())
                     .await;
-                debug!("filled");
             }
             Cmd::DrawImage {
-                top_left,
-                image,
-                scale,
-            } => self.display().draw_image(top_left, image, scale).await,
+                image:
+                    PlacedImage {
+                        top_left,
+                        data,
+                        scale,
+                    },
+            } => self.display().draw_image(top_left, data, scale).await,
+            Cmd::DrawText { text, bg } => {
+                self.display().draw_text(text).await;
+            }
             Cmd::SetBacklight { level } => self.set_backlight(level),
             Cmd::PowerOn => {
                 self.display().power_on().await;
@@ -160,7 +221,7 @@ impl DisplayFlashSpi {
                 self.set_backlight(Backlight::Off);
             }
         }
-        debug!("finished cmd");
+        //defmt::debug!("finished cmd");
     }
 
     pub fn set_backlight(&mut self, level: Backlight) {
@@ -307,14 +368,19 @@ impl<'a> Display<'a> {
         impl Iterator for Scaler<'_> {
             type Item = u8;
             fn next(&mut self) -> Option<Self::Item> {
-                let width = self.width as usize * self.scale as usize;
+                // our job is: given a location on the scaled image, find the location on the
+                // original image.
+                let scaled_width = self.width as usize * self.scale as usize;
+
                 // pixels come in pairs of bytes (u16).
                 let (pos, byte) = (self.pos / 2, self.pos % 2);
-                let (row, col) = (pos / width, pos % width);
+                let (row, col) = (pos / scaled_width, pos % scaled_width);
                 let (orig_row, orig_col) = (row / self.scale as usize, col / self.scale as usize);
-                let out = self.buf.get((orig_row * width + orig_col) * 2 + byte);
+                let out = self
+                    .buf
+                    .get((orig_row * self.width as usize + orig_col) * 2 + byte)?;
                 self.pos += 1;
-                out.map(|s| *s)
+                Some(*out)
             }
         }
 
@@ -322,13 +388,12 @@ impl<'a> Display<'a> {
         let width = buf[0];
         let height = buf[1];
         defmt::debug!(
-            "size ({=u8}, {=u8}) orig ({=u8}, {=u8})",
+            "Drawing image: size ({=u8}, {=u8}) orig ({=u8}, {=u8})",
             width * scale,
             height * scale,
             width,
             height
         );
-        Timer::after(Duration::from_secs(3)).await;
         let buf = &buf[2..];
         let area = Rectangle::new(
             top_left,
@@ -336,48 +401,6 @@ impl<'a> Display<'a> {
         );
         self.draw_rect_iter(area, Scaler::new(scale, width, buf))
             .await
-    }
-
-    /// Copy data from an iterator onto the screen.
-    ///
-    /// This method copies into an intermediate buffer.
-    pub async fn draw_rect_iter(&mut self, area: Rectangle, data: impl IntoIterator<Item = u8>) {
-        check_rect_u16(area);
-        let tl = area.top_left;
-        // No area means top-left = bottom-right
-        let br = match area.bottom_right() {
-            Some(x) => x,
-            None => tl,
-        };
-
-        defmt::debug!("set address window");
-        unwrap!(self.cs_pin.set_low());
-        self.set_address_window(tl.x as u16, tl.y as u16, br.x as u16, br.y as u16);
-
-        defmt::debug!("write to ram");
-        self.send_command(Instruction::WriteToRam);
-        // chunk into slices of max EASY_DMA_SIZE
-        let mut buffer = [0u8; crate::EASY_DMA_SIZE];
-        let mut cnt = 0;
-        let mut i = 0;
-        for (idx, byte) in data.into_iter().enumerate() {
-            *unwrap!(buffer.get_mut(i)) = byte;
-            i += 1;
-            if i >= crate::EASY_DMA_SIZE {
-                //defmt::debug!("send buffer {} (idx {=usize})", cnt, idx);
-                self.send_data_blocking(&buffer);
-                i = 0;
-                cnt += 1;
-            }
-        }
-        defmt::debug!("i = {}", i);
-        // send the last buffer
-        if i > 0 {
-            //defmt::debug!("send buffer remaining {=usize}", i);
-            self.send_data(&buffer[..i]).await;
-        }
-        defmt::debug!("pin high");
-        unwrap!(self.cs_pin.set_high());
     }
 
     /// Draw a filled Rectangle with the given color.
@@ -407,8 +430,90 @@ impl<'a> Display<'a> {
         .await
     }
 
+    /// Only works on ascii - will get garbage with anything else.
+    pub async fn draw_text(&mut self, text: PlacedText) {
+        let mut top_left = text.top_left;
+        for ch in text.text.chars().map(|ch| ch as u8) {
+            defmt::info!("ch {}", ch as char);
+            let extents = match FONT.extents(ch) {
+                Some(e) => e,
+                None => {
+                    defmt::warn!("character {} cannot be drawn", ch as char);
+                    continue;
+                }
+            };
+            defmt::info!("get pixels");
+            // just output black when transparent for now.
+            let pixels = FONT.pixels(extents, text.scale).map(|col| match col {
+                text::Color::Opaque(v) => v,
+                _ => 0xFE6F,
+            });
+            defmt::info!("draw text");
+            self.draw_rect_iter_pixels(
+                Rectangle::new(top_left, FONT.extents_size(extents, text.scale)),
+                pixels,
+            )
+            .await;
+            top_left.x += (extents.width(&FONT) * usize::from(text.scale)) as i32;
+        }
+    }
+
+    pub async fn draw_rect_iter_pixels(
+        &mut self,
+        area: Rectangle,
+        pixel_colors: impl IntoIterator<Item = u16>,
+    ) {
+        self.draw_rect_iter(
+            area,
+            pixel_colors
+                .into_iter()
+                .flat_map(|color| color.to_be_bytes()),
+        )
+        .await
+    }
+
+    /// Copy data from an iterator onto the screen.
+    ///
+    /// This method copies into an intermediate buffer. This is the core method for getting pixels
+    /// on screen: every other method uses this one.
+    ///
+    /// TODO get the next buffer ready while we are DMAing the current one.
+    pub async fn draw_rect_iter(&mut self, area: Rectangle, data: impl IntoIterator<Item = u8>) {
+        check_rect_u16(area);
+        let tl = area.top_left;
+        // No area means top-left = bottom-right
+        let br = match area.bottom_right() {
+            Some(x) => x,
+            None => tl,
+        };
+
+        unwrap!(self.cs_pin.set_low());
+        self.set_address_window(tl.x as u16, tl.y as u16, br.x as u16, br.y as u16);
+
+        self.send_command(Instruction::WriteToRam);
+        // chunk into slices of max EASY_DMA_SIZE
+        let mut buffer = [0u8; crate::EASY_DMA_SIZE];
+        let mut cnt = 0;
+        let mut i = 0;
+        for (idx, byte) in data.into_iter().enumerate() {
+            *unwrap!(buffer.get_mut(i)) = byte;
+            i += 1;
+            if i >= crate::EASY_DMA_SIZE {
+                //defmt::debug!("send buffer {} (idx {=usize})", cnt, idx);
+                self.send_data_blocking(&buffer);
+                i = 0;
+                cnt += 1;
+            }
+        }
+        // send the last buffer
+        if i > 0 {
+            self.send_data(&buffer[..i]).await;
+        }
+        unwrap!(self.cs_pin.set_high());
+    }
+
     pub async fn power_on(&mut self) {
-        self.sleep_off();
+        self.sleep_off().await;
         // clear screen
         self.clear(Rgb565::WHITE).await;
     }
@@ -417,7 +522,7 @@ impl<'a> Display<'a> {
 
     #[inline]
     async fn hard_reset(&mut self) {
-        //debug!("hard_reset");
+        //defmt::debug!("hard_reset");
         unwrap!(self.reset_pin.set_high());
         Timer::after(Duration::from_micros(10)).await;
         unwrap!(self.reset_pin.set_low());
@@ -428,21 +533,21 @@ impl<'a> Display<'a> {
 
     #[inline]
     async fn soft_reset(&mut self) {
-        //debug!("soft_reset");
+        //defmt::debug!("soft_reset");
         self.send_command(Instruction::SoftwareReset);
         Timer::after(Duration::from_millis(150)).await;
     }
 
     #[inline]
     async fn sleep_out(&mut self) {
-        //debug!("sleep_out");
+        //defmt::debug!("sleep_out");
         self.send_command(Instruction::SleepOut);
         Timer::after(Duration::from_millis(10)).await;
     }
 
     #[inline]
     async fn sleep_in(&mut self) {
-        //debug!("sleep_out");
+        //defmt::debug!("sleep_out");
         self.send_command(Instruction::SleepIn);
         Timer::after(Duration::from_millis(10)).await;
     }
@@ -453,7 +558,7 @@ impl<'a> Display<'a> {
         color: RgbInterfaceColorFormat,
         ctrl: ControlInterfaceColorFormat, // this is the one that we use I think
     ) {
-        //debug!("pixel_format");
+        //defmt::debug!("pixel_format");
         // 16bit 65k colors
         self.send_command(Instruction::InterfacePixelFormat);
         self.send_data_blocking(&[color as u8 | ctrl as u8]);
@@ -477,7 +582,7 @@ impl<'a> Display<'a> {
         vertical_scrolling_area: u16,
         bottom_fixed_area: u16,
     ) {
-        //debug!("vertical_scrolling_definition");
+        //defmt::debug!("vertical_scrolling_definition");
         debug_assert_eq!(
             top_fixed_area + vertical_scrolling_area + bottom_fixed_area,
             320
